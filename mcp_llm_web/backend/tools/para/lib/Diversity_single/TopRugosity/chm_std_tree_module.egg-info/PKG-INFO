@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: chm_std_tree_module
+Version: 0.1
+Summary: Compute CHM std in 1m² cells using treeid and local maxima
+Author: Your Name
+Dynamic: author
+Dynamic: summary

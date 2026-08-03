@@ -1,0 +1,6 @@
+cloud_processing.cpp
+setup.py
+cloud_processing.egg-info/PKG-INFO
+cloud_processing.egg-info/SOURCES.txt
+cloud_processing.egg-info/dependency_links.txt
+cloud_processing.egg-info/top_level.txt

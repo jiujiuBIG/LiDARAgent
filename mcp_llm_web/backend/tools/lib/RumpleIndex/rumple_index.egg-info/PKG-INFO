@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: rumple_index
+Version: 0.1
+Summary: Compute Rumple Index from lidar point cloud
+Dynamic: summary

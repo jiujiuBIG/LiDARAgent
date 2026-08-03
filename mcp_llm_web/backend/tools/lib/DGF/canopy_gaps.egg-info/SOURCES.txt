@@ -1,0 +1,6 @@
+canopy_gaps.cpp
+setup.py
+canopy_gaps.egg-info/PKG-INFO
+canopy_gaps.egg-info/SOURCES.txt
+canopy_gaps.egg-info/dependency_links.txt
+canopy_gaps.egg-info/top_level.txt

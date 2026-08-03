@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🌿 LiDAR Agent - 点云智能分析系统</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            forest: {
+              light: '#10B981',
+              DEFAULT: '#059669',
+              dark: '#047857',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    .scrollbar-thin::-webkit-scrollbar { width: 6px; }
+    .scrollbar-thin::-webkit-scrollbar-track { background: #f1f5f9; }
+    .scrollbar-thin::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+    .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+    .typing-cursor::after { content: '|'; animation: blink 1s infinite; }
+    @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
+    .fade-in { animation: fadeIn 0.3s ease-out; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    .drop-zone.drag-over { border-color: #10B981; background-color: #ecfdf5; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    const API_BASE = '/api/v1';
+
+    function App() {
+      const [sessions, setSessions] = useState([]);
+      const [currentSession, setCurrentSession] = useState(null);
+      const [messages, setMessages] = useState([]);
+      const [input, setInput] = useState('');
+      const [files, setFiles] = useState([]);
+      const [uploadedFiles, setUploadedFiles] = useState([]);
+      const [isLoading, setIsLoading] = useState(false);
+      const [isDragOver, setIsDragOver] = useState(false);
+      const [activeTab, setActiveTab] = useState('chat');
+      const [thoughts, setThoughts] = useState([]);
+      const [visualization, setVisualization] = useState(null);
+      const [usedFile, setUsedFile] = useState(null);  // 当前使用的文件
+      const messagesEndRef = useRef(null);
+      const chartRef = useRef(null);
+      const chartInstance = useRef(null);
+
+      useEffect(() => {
+        loadSessions();
+        loadUploadedFiles();
+      }, []);
+
+      useEffect(() => {
+        scrollToBottom();
+      }, [messages]);
+
+      useEffect(() => {
+        if (chartRef.current && visualization) {
+          if (chartInstance.current) {
+            chartInstance.current.dispose();
+          }
+          chartInstance.current = echarts.init(chartRef.current);
+          chartInstance.current.setOption(visualization);
+        }
+      }, [visualization]);
+
+      const scrollToBottom = () => {
+        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      };
+
+      const loadSessions = async () => {
+        try {
+          const res = await fetch(`${API_BASE}/chat/sessions`);
+          const data = await res.json();
+          setSessions(data.sessions || []);
+        } catch (e) {
+          console.error('加载会话失败:', e);
+        }
+      };
+
+      const loadUploadedFiles = async () => {
+        try {
+          const res = await fetch(`${API_BASE}/files/list`);
+          const data = await res.json();
+          setUploadedFiles(data.files || []);
+        } catch (e) {
+          console.error('加载文件失败:', e);
+        }
+      };
+
+      const createSession = () => {
+        const newSession = {
+          id: null,
+          title: '新对话',
+          messages: [],
+          isNew: true
+        };
+        setCurrentSession(newSession);
+        setMessages([]);
+        setThoughts([]);
+        setVisualization(null);
+      };
+
+      const selectSession = (session) => {
+        setCurrentSession(session);
+        setMessages([]);
+        setThoughts([]);
+        setVisualization(null);
+        loadMessages(session.id);
+      };
+
+      const loadMessages = async (sessionId) => {
+        try {
+          const res = await fetch(`${API_BASE}/chat/sessions/${sessionId}`);
+          const data = await res.json();
+          setMessages(data.messages || []);
+          setCurrentSession({ id: sessionId, title: data.title });
+        } catch (e) {
+          console.error('加载消息失败:', e);
+        }
+      };
+
+      const deleteSession = async (sessionId, e) => {
+        e.stopPropagation();
+        if (!confirm('确定删除此对话？')) return;
+        try {
+          await fetch(`${API_BASE}/chat/sessions/${sessionId}`, { method: 'DELETE' });
+          loadSessions();
+          if (currentSession?.id === sessionId) {
+            setCurrentSession(null);
+            setMessages([]);
+          }
+        } catch (e) {
+          console.error('删除会话失败:', e);
+        }
+      };
+
+      const uploadFile = async (file) => {
+        const formData = new FormData();
+        formData.append('file', file);
+        try {
+          const res = await fetch(`${API_BASE}/files/upload`, {
+            method: 'POST',
+            body: formData
+          });
+          console.log('Upload response status:', res.status);
+          if (!res.ok) {
+            const errorText = await res.text();
+            console.error('Upload failed with status:', res.status, 'error:', errorText);
+            throw new Error(`上传失败: ${res.status} - ${errorText}`);
+          }
+          const data = await res.json();
+          console.log('Upload success:', data);
+          setUploadedFiles(prev => [...prev, data]);
+          return data.file_id;
+        } catch (e) {
+          console.error('上传文件失败:', e);
+          alert(`上传失败: ${file.name} - ${e.message}`);
+          return null;
+        }
+      };
+
+      const handleDrop = async (e) => {
+        e.preventDefault();
+        setIsDragOver(false);
+        const droppedFiles = Array.from(e.dataTransfer.files);
+        const validFiles = droppedFiles.filter(f =>
+          ['.ply', '.las', '.laz', '.tif', '.tiff'].some(ext => f.name.toLowerCase().endsWith(ext))
+        );
+        if (validFiles.length === 0) {
+          alert('请上传 .ply, .las, .laz 或 .tif 格式的文件');
+          return;
+        }
+        setFiles(prev => [...prev, ...validFiles]);
+      };
+
+      const removeFile = (index) => {
+        setFiles(prev => prev.filter((_, i) => i !== index));
+      };
+
+      // 获取最近上传的文件
+      const getLatestFile = async () => {
+        try {
+          const res = await fetch(`${API_BASE}/files/list`);
+          const data = await res.json();
+          if (data.files && data.files.length > 0) {
+            return data.files[0].id;  // 返回最近的文件
+          }
+        } catch (e) {
+          console.error('获取最近文件失败:', e);
+        }
+        return null;
+      };
+
+      const handleSend = async () => {
+        if (!input.trim() && files.length === 0) return;
+
+        setIsLoading(true);
+        const userMessage = { role: 'user', content: input, timestamp: new Date().toISOString() };
+        setMessages(prev => [...prev, userMessage]);
+
+        try {
+          let fileIds = [];
+
+          // 如果有新拖拽的文件，先上传
+          for (const file of files) {
+            const fileId = await uploadFile(file);
+            if (fileId) fileIds.push(fileId);
+          }
+          setFiles([]);
+
+          // 如果没有新文件，获取最近上传的文件
+          if (fileIds.length === 0) {
+            const latestFileId = await getLatestFile();
+            if (latestFileId) {
+              fileIds = [latestFileId];
+              // 获取文件的详细信息
+              const filesRes = await fetch(`${API_BASE}/files/list`);
+              const filesData = await filesRes.json();
+              const latestFile = filesData.files?.find(f => f.id === latestFileId);
+              if (latestFile) {
+                setUsedFile(latestFile);
+              }
+            }
+          }
+
+          const sessionId = currentSession?.id || undefined;
+          const res = await fetch(`${API_BASE}/chat/send`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              message: input,
+              session_id: sessionId,
+              file_ids: fileIds
+            })
+          });
+
+          const data = await res.json();
+          setCurrentSession({ id: data.session_id, title: input.slice(0, 30) + '...' });
+          loadSessions();
+
+          const outputPath = data.output_path || null;
+          const toolData = data.tool_data || null;
+
+          setMessages(prev => [...prev, {
+            role: 'assistant',
+            content: data.message,
+            timestamp: new Date().toISOString(),
+            thoughts: data.thoughts,
+            output_path: outputPath,
+            tool_data: toolData
+          }]);
+          setThoughts(data.thoughts || []);
+          setInput('');
+
+        } catch (e) {
+          console.error('发送消息失败:', e);
+          setMessages(prev => [...prev, {
+            role: 'assistant',
+            content: '抱歉，发生了错误。请稍后重试。',
+            timestamp: new Date().toISOString()
+          }]);
+        } finally {
+          setIsLoading(false);
+        }
+      };
+
+      const formatTime = (timestamp) => {
+        return new Date(timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+      };
+
+      const renderMarkdown = (text) => {
+        if (!text) return '';
+        return text
+          .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+          .replace(/`([^`]+)`/g, '<code class="bg-gray-100 px-1 rounded text-sm">$1</code>')
+          .replace(/\n/g, '<br>');
+      };
+
+      return (
+        <div className="flex h-screen bg-gray-50">
+          {/* 侧边栏 */}
+          <div className="w-64 bg-white border-r border-gray-200 flex flex-col">
+            <div className="p-4 border-b border-gray-200">
+              <div className="flex items-center gap-2 text-forest DEFAULT">
+                <span className="text-2xl">🌲</span>
+                <span className="font-bold text-lg">LiDAR Agent</span>
+              </div>
+              <p className="text-xs text-gray-500 mt-1">点云智能分析系统</p>
+            </div>
+
+            <div className="p-3">
+              <button
+                onClick={createSession}
+                className="w-full py-2 px-4 bg-forest DEFAULT text-white rounded-lg hover:bg-forest-dark transition flex items-center justify-center gap-2"
+              >
+                <span>+</span> 新建对话
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto scrollbar-thin">
+              <div className="px-3 pb-2">
+                <p className="text-xs font-medium text-gray-500 uppercase px-2">历史对话</p>
+              </div>
+              {sessions.map(session => (
+                <div
+                  key={session.id}
+                  onClick={() => selectSession(session)}
+                  className={`mx-2 p-3 rounded-lg cursor-pointer transition flex items-center justify-between group ${
+                    currentSession?.id === session.id ? 'bg-forest-50 border border-forest-200' : 'hover:bg-gray-100'
+                  }`}
+                >
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-gray-700 truncate">{session.title}</p>
+                    <p className="text-xs text-gray-400">{formatTime(session.updated_at)}</p>
+                  </div>
+                  <button
+                    onClick={(e) => deleteSession(session.id, e)}
+                    className="opacity-0 group-hover:opacity-100 p-1 text-gray-400 hover:text-red-500 transition"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                    </svg>
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div className="p-3 border-t border-gray-200">
+              <div className="flex items-center gap-2 text-sm text-gray-500">
+                <span className="w-2 h-2 bg-green-500 rounded-full"></span>
+                <span>模型: LiDAR Agent</span>
+              </div>
+            </div>
+          </div>
+
+          {/* 主内容区 */}
+          <div className="flex-1 flex flex-col">
+            {/* 顶部栏 */}
+            <div className="h-14 bg-white border-b border-gray-200 flex items-center justify-between px-4">
+              <div className="flex gap-4">
+                <button
+                  onClick={() => setActiveTab('chat')}
+                  className={`px-3 py-2 text-sm font-medium transition ${
+                    activeTab === 'chat' ? 'text-forest DEFAULT border-b-2 border-forest DEFAULT' : 'text-gray-500 hover:text-gray-700'
+                  }`}
+                >
+                  💬 对话
+                </button>
+                <button
+                  onClick={() => setActiveTab('files')}
+                  className={`px-3 py-2 text-sm font-medium transition ${
+                    activeTab === 'files' ? 'text-forest DEFAULT border-b-2 border-forest DEFAULT' : 'text-gray-500 hover:text-gray-700'
+                  }`}
+                >
+                  📁 文件管理
+                </button>
+              </div>
+              <div className="text-sm text-gray-500">
+                {isLoading ? <span className="text-forest DEFAULT">分析中...</span> : '就绪'}
+              </div>
+            </div>
+
+            {/* 内容区域 */}
+            <div className="flex-1 overflow-hidden flex">
+              {activeTab === 'chat' ? (
+                <>
+                  {/* 聊天区域 */}
+                  <div className="flex-1 flex flex-col">
+                    <div className="flex-1 overflow-y-auto p-4 scrollbar-thin">
+                      {messages.length === 0 && (
+                        <div className="h-full flex flex-col items-center justify-center text-center">
+                          <div className="text-6xl mb-4">🌲</div>
+                          <h2 className="text-2xl font-bold text-gray-700 mb-2">LiDAR Agent</h2>
+                          <p className="text-gray-500 mb-6">点云智能分析系统 - 基于 DeepSeek-R1-Distill-Qwen 32B</p>
+                          <div className="flex gap-2 flex-wrap justify-center max-w-lg">
+                            <span className="px-3 py-1 bg-gray-100 text-gray-600 rounded-full text-sm">点云预处理</span>
+                            <span className="px-3 py-1 bg-gray-100 text-gray-600 rounded-full text-sm">单木分割</span>
+                            <span className="px-3 py-1 bg-gray-100 text-gray-600 rounded-full text-sm">枝叶分离</span>
+                            <span className="px-3 py-1 bg-gray-100 text-gray-600 rounded-full text-sm">森林结构参数提取</span>
+                          </div>
+                        </div>
+                      )}
+
+                      {messages.map((msg, idx) => (
+                        <div key={idx} className={`fade-in mb-4 ${msg.role === 'user' ? 'flex justify-end' : ''}`}>
+                          {msg.role === 'user' ? (
+                            <div className="max-w-2xl bg-forest DEFAULT text-white px-4 py-3 rounded-2 rounded-br-sm">
+                              <p>{msg.content}</p>
+                              <p className="text-xs text-green-100 mt-1">{formatTime(msg.timestamp)}</p>
+                            </div>
+                          ) : (
+                            <div className="max-w-2xl bg-white border border-gray-200 px-4 py-3 rounded-2 rounded-bl-sm">
+                              <div className="prose prose-sm max-w-none" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}></div>
+                              <p className="text-xs text-gray-400 mt-2">{formatTime(msg.timestamp)}</p>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+
+                      {isLoading && (
+                        <div className="flex items-center gap-2 text-gray-500">
+                          <div className="flex gap-1">
+                            <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
+                            <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
+                            <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
+                          </div>
+                          <span className="text-sm">LiDAR Agent 思考中...</span>
+                        </div>
+                      )}
+                      <div ref={messagesEndRef} />
+                    </div>
+
+                    {/* Agent 思考过程 */}
+                    {thoughts.length > 0 && (
+                      <div className="bg-yellow-50 border-t border-yellow-200 px-4 py-3">
+                        <p className="text-sm font-medium text-yellow-800 mb-2">🤔 分析过程</p>
+                        <div className="space-y-1">
+                          {thoughts.map((thought, idx) => (
+                            <div key={idx} className="text-xs text-yellow-700 flex items-center gap-2">
+                              <span className={`w-4 h-4 rounded-full flex items-center justify-center text-[10px] ${
+                                thought.progress === 100 ? 'bg-green-500 text-white' :
+                                thought.progress ? 'bg-yellow-500 text-white' : 'bg-gray-300 text-gray-600'
+                              }`}>
+                                {thought.progress === 100 ? '✓' : thought.progress ? '...' : '○'}
+                              </span>
+                              <span>{thought.thought}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 文件拖拽区 */}
+                    <div
+                      className={`drop-zone border-t border-gray-200 p-4 transition ${isDragOver ? 'drag-over' : 'bg-gray-50'}`}
+                      onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
+                      onDragLeave={() => setIsDragOver(false)}
+                      onDrop={handleDrop}
+                    >
+                      {files.length > 0 ? (
+                        <div className="mb-3">
+                          <p className="text-xs text-gray-500 mb-2">待上传文件:</p>
+                          <div className="flex flex-wrap gap-2">
+                            {files.map((file, idx) => (
+                              <div key={idx} className="flex items-center gap-2 bg-white border border-gray-200 px-3 py-2 rounded-lg">
+                                <span className="text-sm text-gray-700">{file.name}</span>
+                                <button onClick={() => removeFile(idx)} className="text-gray-400 hover:text-red-500">
+                                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                                  </svg>
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ) : (
+                        <p className="text-sm text-gray-400 text-center mb-2">或将 .ply, .las, .laz, .tif 文件拖拽到此处</p>
+                      )}
+
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          value={input}
+                          onChange={(e) => setInput(e.target.value)}
+                          onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
+                          placeholder="输入您的问题..."
+                          className="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-forest DEFAULT focus:border-transparent"
+                          disabled={isLoading}
+                        />
+                        <button
+                          onClick={handleSend}
+                          disabled={isLoading || (!input.trim() && files.length === 0)}
+                          className="px-6 py-3 bg-forest DEFAULT text-white rounded-lg hover:bg-forest-dark transition disabled:opacity-50 disabled:cursor-not-allowed font-medium"
+                        >
+                          发送
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 可视化面板 */}
+                  {(visualization || uploadedFiles.length > 0 || usedFile) && (
+                    <div className="w-96 bg-white border-l border-gray-200 flex flex-col">
+                      <div className="p-4 border-b border-gray-200">
+                        <h3 className="font-medium text-gray-700">📊 分析结果</h3>
+                      </div>
+                      <div className="flex-1 overflow-y-auto p-4 scrollbar-thin">
+                        {/* 当前使用的文件 */}
+                        {usedFile && (
+                          <div className="mb-4">
+                            <p className="text-xs font-medium text-gray-500 mb-2">🔧 正在处理</p>
+                            <div className="bg-forest-50 border border-forest-200 px-3 py-2 rounded-lg">
+                              <p className="text-sm font-medium text-forest DEFAULT">{usedFile.filename}</p>
+                              <p className="text-xs text-gray-500">{usedFile.file_type} · {formatFileSize(usedFile.file_size)}</p>
+                            </div>
+                          </div>
+                        )}
+                        {uploadedFiles.length > 0 && (
+                          <div className="mb-4">
+                            <p className="text-xs font-medium text-gray-500 mb-2">已上传文件</p>
+                            {uploadedFiles.map(file => (
+                              <div key={file.id} className="bg-gray-50 px-3 py-2 rounded-lg mb-2">
+                                <p className="text-sm font-medium text-gray-700">{file.filename}</p>
+                                <p className="text-xs text-gray-500">{file.file_type} · {formatFileSize(file.file_size)}</p>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {visualization && (
+                          <div ref={chartRef} className="w-full h-64"></div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </>
+              ) : (
+                /* 文件管理页面 */
+                <div className="flex-1 p-6 overflow-y-auto scrollbar-thin">
+                  <div
+                    className={`border-2 border-dashed rounded-xl p-8 text-center transition ${
+                      isDragOver ? 'border-forest DEFAULT bg-forest-50' : 'border-gray-300 hover:border-forest-300'
+                    }`}
+                    onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
+                    onDragLeave={() => setIsDragOver(false)}
+                    onDrop={handleDrop}
+                  >
+                    <div className="text-4xl mb-4">📁</div>
+                    <p className="text-gray-600 mb-2">将文件拖拽到此处或点击选择</p>
+                    <p className="text-sm text-gray-400 mb-4">支持 .ply, .las, .laz, .tif 格式</p>
+                    <input
+                      type="file"
+                      multiple
+                      accept=".ply,.las,.laz,.tif,.tiff"
+                      onChange={(e) => {
+                        const newFiles = Array.from(e.target.files);
+                        setFiles(prev => [...prev, ...newFiles]);
+                      }}
+                      className="hidden"
+                      id="fileInput"
+                    />
+                    <label
+                      htmlFor="fileInput"
+                      className="inline-block px-4 py-2 bg-forest DEFAULT text-white rounded-lg cursor-pointer hover:bg-forest-dark transition"
+                    >
+                      选择文件
+                    </label>
+                  </div>
+
+                  {files.length > 0 && (
+                    <div className="mt-6">
+                      <h3 className="font-medium text-gray-700 mb-3">待上传文件</h3>
+                      <div className="space-y-2">
+                        {files.map((file, idx) => (
+                          <div key={idx} className="flex items-center justify-between bg-white border border-gray-200 px-4 py-3 rounded-lg">
+                            <div className="flex items-center gap-3">
+                              <span className="text-2xl">📄</span>
+                              <div>
+                                <p className="text-sm font-medium text-gray-700">{file.name}</p>
+                                <p className="text-xs text-gray-400">{formatFileSize(file.size)}</p>
+                              </div>
+                            </div>
+                            <button
+                              onClick={() => removeFile(idx)}
+                              className="p-2 text-gray-400 hover:text-red-500 transition"
+                            >
+                              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                              </svg>
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                      <button
+                        onClick={() => {
+                          files.forEach(file => uploadFile(file).then(() => loadUploadedFiles()));
+                          setFiles([]);
+                        }}
+                        className="mt-4 px-6 py-3 bg-forest DEFAULT text-white rounded-lg hover:bg-forest-dark transition"
+                      >
+                        全部上传
+                      </button>
+                    </div>
+                  )}
+
+                  {uploadedFiles.length > 0 && (
+                    <div className="mt-6">
+                      <h3 className="font-medium text-gray-700 mb-3">已上传文件</h3>
+                      <div className="grid grid-cols-2 gap-3">
+                        {uploadedFiles.map(file => (
+                          <div key={file.id} className="bg-white border border-gray-200 px-4 py-3 rounded-lg">
+                            <div className="flex items-center gap-3">
+                              <span className="text-2xl">{getFileIcon(file.file_type)}</span>
+                              <div className="flex-1 min-w-0">
+                                <p className="text-sm font-medium text-gray-700 truncate">{file.filename}</p>
+                                <p className="text-xs text-gray-400">{file.file_type} · {formatFileSize(file.file_size)}</p>
+                              </div>
+                            </div>
+                            <div className="mt-2 flex gap-2">
+                              <button className="flex-1 py-1 text-xs bg-gray-100 text-gray-600 rounded hover:bg-gray-200">
+                                使用此文件
+                              </button>
+                              <button
+                                onClick={async () => {
+                                  if (confirm('确定删除此文件？')) {
+                                    await fetch(`${API_BASE}/files/${file.id}`, { method: 'DELETE' });
+                                    loadUploadedFiles();
+                                  }
+                                }}
+                                className="px-3 py-1 text-xs bg-red-50 text-red-600 rounded hover:bg-red-100"
+                              >
+                                删除
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function formatFileSize(bytes) {
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    }
+
+    function getFileIcon(type) {
+      const icons = {
+        ply: '📦',
+        las: '📦',
+        laz: '📦',
+        tif: '🖼️',
+        tiff: '🖼️',
+        shp: '🗺️',
+        geojson: '🗺️'
+      };
+      return icons[type] || '📄';
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+canopy_gaps.cpp
+setup.py
+fraction_canopy_gaps.egg-info/PKG-INFO
+fraction_canopy_gaps.egg-info/SOURCES.txt
+fraction_canopy_gaps.egg-info/dependency_links.txt
+fraction_canopy_gaps.egg-info/top_level.txt

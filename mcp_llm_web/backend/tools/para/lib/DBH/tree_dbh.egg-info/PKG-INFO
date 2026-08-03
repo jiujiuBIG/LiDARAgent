@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: tree_dbh
+Version: 0.1.0
+Summary: DBH computation per tree from xyz + treeid (C++/pybind11)
+Dynamic: summary

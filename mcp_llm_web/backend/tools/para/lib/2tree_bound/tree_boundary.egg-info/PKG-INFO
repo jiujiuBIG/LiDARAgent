@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: tree_boundary
+Version: 0.1.0
+Summary: Convex-hull based boundary tree filtering (C++/pybind11)
+Dynamic: summary

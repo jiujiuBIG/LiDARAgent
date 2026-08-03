@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: rumple_index_module
+Version: 0.1
+Summary: Compute Rumple Index (canopy surface area / projected area) from point cloud
+Author: Your Name
+Dynamic: author
+Dynamic: summary

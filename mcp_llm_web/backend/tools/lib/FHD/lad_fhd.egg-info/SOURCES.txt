@@ -1,0 +1,6 @@
+lad_fhd.cpp
+setup.py
+lad_fhd.egg-info/PKG-INFO
+lad_fhd.egg-info/SOURCES.txt
+lad_fhd.egg-info/dependency_links.txt
+lad_fhd.egg-info/top_level.txt

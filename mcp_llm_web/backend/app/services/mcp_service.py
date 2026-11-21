@@ -3,10 +3,15 @@ import json
 import os
 import re
 from contextlib import AsyncExitStack
+from pathlib import Path
+from sys import float_info
 from typing import Optional, Dict, Any, List
+from uuid import uuid4
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from app.core.config import settings
+
+NORMALS_TOOL = "estimate_point_cloud_normals"
 
 # TOOL_TRIGGERS = {
 #     "read_point_cloud": ["读取点云", "加载点云", "打开点云", "read point cloud", "load point cloud", "open point cloud"],
@@ -105,6 +110,7 @@ class MCPService:
         await self.connect_to_server(f"{base_dir}/tools/Product/dsm.py")
         await self.connect_to_server(f"{base_dir}/tools/Product/dtm.py")
         await self.connect_to_server(f"{base_dir}/tools/Product/chm.py")
+        await self.connect_to_server(f"{base_dir}/tools/Preprocessing/estimate_normals.py")
         # await self.connect_to_server(f"{base_dir}/tools/Segmentation/Treeseg_base.py")
         print(f"📦 共加载 {len(self.all_tools)} 个工具")
 
@@ -130,7 +136,11 @@ class MCPService:
         return tools
 
     async def call_tool(
-        self, tool_name: str, query: str, file_context: list = None
+        self,
+        tool_name: str,
+        query: str,
+        file_context: list = None,
+        arguments: Optional[Dict[str, Any]] = None,
     ) -> dict:
         print()
         if tool_name not in self.all_tools:
@@ -145,11 +155,26 @@ class MCPService:
         session = tool_info["session"]
         input_schema = tool_info.get("inputSchema", {})
 
-        args = self.parse_tool_args(tool_name, query, input_schema, file_context)
+        try:
+            args = (
+                self.parse_normal_args(file_context, arguments)
+                if tool_name == NORMALS_TOOL
+                else self.parse_tool_args(tool_name, query, input_schema, file_context)
+            )
+        except ValueError as exc:
+            return {"status": "error", "output_path": None, "message": str(exc), "data": None}
 
         try:
             result = await session.call_tool(tool_name, args)
             raw_result = result.content[0].text if result.content else "{}"
+
+            if tool_name == NORMALS_TOOL:
+                if getattr(result, "isError", False):
+                    raise ValueError(raw_result)
+                parsed = json.loads(raw_result)
+                if not isinstance(parsed, dict) or parsed.get("status") not in ("success", "error"):
+                    raise ValueError("法向量工具返回了无法解析的结果。")
+                return parsed
 
             try:
                 parsed = json.loads(raw_result)
@@ -176,6 +201,45 @@ class MCPService:
         if isinstance(result, dict):
             return result.get("message", "") or ""
         return str(result) if result else ""
+
+    def parse_normal_args(self, file_context: Optional[list], arguments: Optional[dict]) -> dict:
+        if len(file_context or []) != 1:
+            raise ValueError("请为法向量估计选择一份 LAS 或 LAZ 文件。")
+        file_path = file_context[0].get("file_path") or ""
+        if Path(file_path).suffix.lower() not in (".las", ".laz") or not os.path.isfile(file_path):
+            raise ValueError("选中的 LAS 或 LAZ 文件不可用，请重新上传或选择。")
+
+        arguments = arguments if isinstance(arguments, dict) else {}
+        radius = arguments.get("radius")
+        if radius is None:
+            raise ValueError(
+                "请确认搜索半径，使用点云 XYZ 的坐标单位。"
+                "如果坐标单位是米，可以从 0.25 米试起。"
+                "邻居上限可参考混合点云 32、平整地面 128、移动扫描树干 64、细枝与树冠试跑 16。"
+                "请回复所选半径和邻居数，例如「确认坐标单位是米，用 0.25 米半径、"
+                "最多 32 个邻居计算法向量」。所选参数用于整份点云。"
+            )
+        if type(radius) not in (int, float) or not 0 < radius <= float_info.max:
+            raise ValueError("请提供大于 0 的搜索半径，并使用点云坐标的单位。")
+        max_nn = arguments.get("max_nn", 32)
+        if type(max_nn) is not int or max_nn < 12:
+            raise ValueError("最大邻居数必须是不小于 12 的整数。")
+        orientation = arguments.get("orientation", "none")
+        if orientation not in ("none", "up", "stem_outward"):
+            raise ValueError("请选择基础法向量、朝上（+Z）或树干朝外。")
+        tool_arguments = {
+            "file_path": file_path,
+            "radius": radius,
+            "max_nn": max_nn,
+            "orientation": orientation,
+            "output_path": str(settings.RESULTS_DIR / uuid4().hex),
+        }
+        if orientation == "stem_outward":
+            label_schema = arguments.get("label_schema")
+            if label_schema not in ("forinstance", "nibio_mls"):
+                raise ValueError("树干朝外需要标签约定。请说明使用 FORinstance 还是 NIBIO_MLS 的标签。")
+            tool_arguments["label_schema"] = label_schema
+        return tool_arguments
 
     def parse_tool_args(
         self, tool_name: str, query: str, input_schema: Dict, file_context: list = None

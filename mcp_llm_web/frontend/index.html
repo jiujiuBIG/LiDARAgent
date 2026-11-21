@@ -257,7 +257,6 @@
           setCurrentSession({ id: data.session_id, title: input.slice(0, 30) + '...' });
           loadSessions();
 
-          const outputPath = data.output_path || null;
           const toolData = data.tool_data || null;
 
           setMessages(prev => [...prev, {
@@ -265,7 +264,7 @@
             content: data.message,
             timestamp: new Date().toISOString(),
             thoughts: data.thoughts,
-            output_path: outputPath,
+            download_url: data.download_url,
             tool_data: toolData
           }]);
           setThoughts(data.thoughts || []);
@@ -410,6 +409,15 @@
                           ) : (
                             <div className="max-w-2xl bg-white border border-gray-200 px-4 py-3 rounded-2 rounded-bl-sm">
                               <div className="prose prose-sm max-w-none" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}></div>
+                              {msg.download_url && (
+                                <a
+                                  href={msg.download_url}
+                                  download
+                                  className="inline-flex mt-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm font-medium text-emerald-800 hover:bg-emerald-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-600"
+                                >
+                                  下载 LAS
+                                </a>
+                              )}
                               <p className="text-xs text-gray-400 mt-2">{formatTime(msg.timestamp)}</p>
                             </div>
                           )}

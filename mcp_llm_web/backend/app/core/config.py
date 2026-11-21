@@ -16,6 +16,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://127.0.0.1:8000/v1")
 LLM_MODEL = os.getenv("LLM_MODEL", "forestmind")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 
 MCP_TOOLS_DIR = BASE_DIR / "tools"
 
@@ -35,8 +36,9 @@ class Settings:
     MCP_TOOLS_DIR: Path = MCP_TOOLS_DIR
     DATABASE_URL: str = DATABASE_URL
 
-    LLM_BASE_URL: str = "http://127.0.0.1:8000/v1"
-    LLM_MODEL: str = "forestmind"
+    LLM_BASE_URL: str = LLM_BASE_URL
+    LLM_MODEL: str = LLM_MODEL
+    LLM_API_KEY: str = LLM_API_KEY
 
     MAX_CONCURRENT_TASKS: int = 5
     TASK_TIMEOUT: int = 300

@@ -3,7 +3,7 @@ import re
 from typing import Dict, Any, Optional, List, AsyncIterator
 from app.services.llm_service import llm_service
 from pydantic import BaseModel
-from app.services.mcp_service import mcp_service
+from app.services.mcp_service import NORMALS_TOOL, mcp_service
 
 
 class AgentThought(BaseModel):
@@ -179,11 +179,25 @@ class AgentService:
                 }
             )
 
-            tool_result = await mcp_service.call_tool(tool_name, message, file_context)
+            if tool_name == NORMALS_TOOL:
+                tool_result = await mcp_service.call_tool(
+                    tool_name, message, file_context, arguments=tool_call_info.get("arguments")
+                )
+            else:
+                tool_result = await mcp_service.call_tool(tool_name, message, file_context)
+            normal_error = tool_name == NORMALS_TOOL and tool_result.get("status") == "error"
+            actual_arguments = {}
+            if tool_name == NORMALS_TOOL and not normal_error:
+                normal_data = tool_result["data"]
+                actual_arguments = {
+                    key: normal_data[key]
+                    for key in ("radius", "max_nn", "orientation", "label_schema")
+                    if key in normal_data
+                }
             tool_results.append(
                 {
                     "tool": tool_name,
-                    "arguments": {},
+                    "arguments": actual_arguments,
                     "result": tool_result,
                 }
             )
@@ -191,7 +205,7 @@ class AgentService:
             thoughts.append(
                 {
                     "step": "executing",
-                    "thought": f"✅ 工具 {tool_name} 执行完成",
+                    "thought": "法向量估计未完成" if normal_error else f"✅ 工具 {tool_name} 执行完成",
                     "tool_calls": [tool_name],
                     "progress": 60,
                 }
@@ -213,12 +227,15 @@ class AgentService:
                 },
             ]
 
-            response = await llm_service.chat_complete(messages=messages)
+            if normal_error:
+                response = {"content": message_for_llm}
+            else:
+                response = await llm_service.chat_complete(messages=messages)
 
             thoughts.append(
                 {
                     "step": "completed",
-                    "thought": "分析完成",
+                    "thought": message_for_llm if normal_error else "分析完成",
                     "tool_calls": [tool_name],
                     "progress": 100,
                 }

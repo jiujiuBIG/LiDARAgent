@@ -1,5 +1,6 @@
 from openai import AsyncOpenAI
 from app.core.config import settings
+from app.services.mcp_service import NORMALS_TOOL
 from typing import AsyncIterator, Dict, Any, Optional, List
 import json
 import re
@@ -7,7 +8,9 @@ import re
 
 class LLMService:
     def __init__(self):
-        self.client = AsyncOpenAI(api_key="", base_url=settings.LLM_BASE_URL)
+        self.client = AsyncOpenAI(
+            api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL
+        )
         self.model = settings.LLM_MODEL
 
     async def chat(
@@ -80,6 +83,25 @@ class LLMService:
             for f in (file_context or [])
         ]
 
+        normals_instructions = ""
+        if NORMALS_TOOL in tool_names:
+            normals_instructions = (
+                "For a clear request to estimate point-cloud normals, select "
+                "estimate_point_cloud_normals even when the file or radius is missing; "
+                "the backend will ask for missing inputs. For that tool only, include an "
+                "arguments object with the numerical radius in the input XYZ coordinate units "
+                "and max_nn as an integer when specified. Omit orientation by default, including "
+                "when the user only mentions labelled data or a type of surface. Set orientation "
+                "to 'up' only for an explicit upward orientation request, or 'stem_outward' only "
+                "for an explicit request to orient stem normals outward. For 'stem_outward', "
+                "include label_schema 'forinstance' or 'nibio_mls' only when the user has supplied "
+                "that label convention for the current file. If the convention is unknown, omit it "
+                "so the backend can ask. "
+                "When the assistant has asked the user to confirm a search radius, wait for the "
+                "user to state the desired radius before including it in arguments. "
+                "Omit parameters the user has not established. Convert units only when the "
+                "point cloud coordinate units are known. Never return input or output paths."
+            )
         router_messages = [
             {
                 "role": "system",
@@ -87,7 +109,8 @@ class LLMService:
                     "You are a router for MCP tools in a LiDAR forestry analysis system. "
                     "Choose exactly one tool only when the user clearly wants to run an available MCP tool. "
                     "If the user is asking a general question, or there is not enough information to execute a tool, choose null. "
-                    'Return JSON only, with this shape: {"tool_name": string|null, "reason": string}.'
+                    'Return JSON only with "tool_name" and "reason", plus "arguments" when instructed. '
+                    + normals_instructions
                 ),
             },
             {
@@ -119,10 +142,14 @@ class LLMService:
                     "reason": f"LLM selected unknown tool: {tool_name}",
                 }
 
-            return {
+            selection = {
                 "tool_name": tool_name,
                 "reason": data.get("reason", ""),
             }
+            if tool_name == NORMALS_TOOL:
+                arguments = data.get("arguments")
+                selection["arguments"] = arguments if isinstance(arguments, dict) else {}
+            return selection
         except Exception as e:
             return {
                 "tool_name": None,

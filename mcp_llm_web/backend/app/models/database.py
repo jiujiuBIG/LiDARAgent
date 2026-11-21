@@ -163,6 +163,16 @@ class DatabaseService:
             return message
 
     @staticmethod
+    async def get_message(session_id: str, message_id: int) -> Optional[MessageModel]:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(MessageModel).where(
+                    MessageModel.session_id == session_id, MessageModel.id == message_id,
+                )
+            )
+            return result.scalar_one_or_none()
+
+    @staticmethod
     async def get_messages(session_id: str) -> List[MessageModel]:
         async with async_session_maker() as session:
             result = await session.execute(

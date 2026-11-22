@@ -12,6 +12,8 @@ from mcp.client.stdio import stdio_client
 from app.core.config import settings
 
 NORMALS_TOOL = "estimate_point_cloud_normals"
+WATERSHED_TOOL = "segment_trees_watershed"
+PYCROWN_TOOL = "segment_trees_pycrown"
 
 # TOOL_TRIGGERS = {
 #     "read_point_cloud": ["读取点云", "加载点云", "打开点云", "read point cloud", "load point cloud", "open point cloud"],
@@ -111,7 +113,8 @@ class MCPService:
         await self.connect_to_server(f"{base_dir}/tools/Product/dtm.py")
         await self.connect_to_server(f"{base_dir}/tools/Product/chm.py")
         await self.connect_to_server(f"{base_dir}/tools/Preprocessing/estimate_normals.py")
-        # await self.connect_to_server(f"{base_dir}/tools/Segmentation/Treeseg_base.py")
+        await self.connect_to_server(f"{base_dir}/tools/Segmentation/watershed_segmentation.py")
+        await self.connect_to_server(f"{base_dir}/tools/Segmentation/pycrown_segmentation.py")
         print(f"📦 共加载 {len(self.all_tools)} 个工具")
 
     def detect_tool_call(self, text: str) -> Optional[Dict[str, Any]]:
@@ -156,11 +159,14 @@ class MCPService:
         input_schema = tool_info.get("inputSchema", {})
 
         try:
-            args = (
-                self.parse_normal_args(file_context, arguments)
-                if tool_name == NORMALS_TOOL
-                else self.parse_tool_args(tool_name, query, input_schema, file_context)
-            )
+            if tool_name == NORMALS_TOOL:
+                args = self.parse_normal_args(file_context, arguments)
+            elif tool_name == WATERSHED_TOOL:
+                args = self.parse_watershed_args(file_context, arguments)
+            elif tool_name == PYCROWN_TOOL:
+                args = self.parse_pycrown_args(file_context, arguments)
+            else:
+                args = self.parse_tool_args(tool_name, query, input_schema, file_context)
         except ValueError as exc:
             return {"status": "error", "output_path": None, "message": str(exc), "data": None}
 
@@ -168,12 +174,12 @@ class MCPService:
             result = await session.call_tool(tool_name, args)
             raw_result = result.content[0].text if result.content else "{}"
 
-            if tool_name == NORMALS_TOOL:
+            if tool_name in (NORMALS_TOOL, WATERSHED_TOOL, PYCROWN_TOOL):
                 if getattr(result, "isError", False):
                     raise ValueError(raw_result)
                 parsed = json.loads(raw_result)
                 if not isinstance(parsed, dict) or parsed.get("status") not in ("success", "error"):
-                    raise ValueError("法向量工具返回了无法解析的结果。")
+                    raise ValueError("工具返回了无法解析的结果。")
                 return parsed
 
             try:
@@ -239,6 +245,130 @@ class MCPService:
             if label_schema not in ("forinstance", "nibio_mls"):
                 raise ValueError("树干朝外需要标签约定。请说明使用 FORinstance 还是 NIBIO_MLS 的标签。")
             tool_arguments["label_schema"] = label_schema
+        return tool_arguments
+
+    def parse_watershed_args(self, file_context: Optional[list], arguments: Optional[dict]) -> dict:
+        valid_files = [
+            f for f in (file_context or [])
+            if Path(f.get("file_path") or "").suffix.lower() in (".las", ".laz", ".tif", ".tiff")
+            and os.path.isfile(f.get("file_path") or "")
+        ]
+        if not valid_files:
+            raise ValueError("请为分水岭单木分割选择一份 LAS/LAZ 点云或 TIF/TIFF 冠层高度图文件。")
+
+        point_clouds = [f for f in valid_files if Path(f["file_path"]).suffix.lower() in (".las", ".laz")]
+        rasters = [f for f in valid_files if Path(f["file_path"]).suffix.lower() in (".tif", ".tiff")]
+
+        primary_file = (rasters[0] if rasters else point_clouds[0])["file_path"]
+        point_cloud_path = point_clouds[0]["file_path"] if (rasters and point_clouds) else None
+
+        arguments = arguments if isinstance(arguments, dict) else {}
+        sigma_m = arguments.get("sigma_m", 0.35)
+        min_distance_m = arguments.get("min_distance_m", 0.75)
+        min_canopy_height_m = arguments.get("min_canopy_height_m", 2.0)
+        chm_resolution_m = arguments.get("chm_resolution_m", 0.5)
+        use_pointcloud_supplement = arguments.get("use_pointcloud_supplement", True)
+
+        if type(sigma_m) not in (int, float) or not 0 <= sigma_m <= float_info.max:
+            raise ValueError("平滑半径 sigma_m 必须是不小于 0 的数字（米）。")
+        if type(min_distance_m) not in (int, float) or not 0 < min_distance_m <= float_info.max:
+            raise ValueError("最小树顶间距 min_distance_m 必须是大于 0 的数字（米）。")
+        if type(min_canopy_height_m) not in (int, float) or not 0 <= min_canopy_height_m <= float_info.max:
+            raise ValueError("最小冠层高度 min_canopy_height_m 必须是不小于 0 的数字（米）。")
+        if type(chm_resolution_m) not in (int, float) or not 0 < chm_resolution_m <= float_info.max:
+            raise ValueError("CHM 分辨率 chm_resolution_m 必须是大于 0 的数字（米）。")
+        if not isinstance(use_pointcloud_supplement, bool):
+            raise ValueError("use_pointcloud_supplement 必须为布尔值。")
+
+        tool_arguments = {
+            "file_path": primary_file,
+            "sigma_m": float(sigma_m),
+            "min_distance_m": float(min_distance_m),
+            "min_canopy_height_m": float(min_canopy_height_m),
+            "chm_resolution_m": float(chm_resolution_m),
+            "use_pointcloud_supplement": use_pointcloud_supplement,
+            "output_path": str(settings.RESULTS_DIR / uuid4().hex),
+        }
+        if point_cloud_path:
+            tool_arguments["point_cloud_path"] = point_cloud_path
+        return tool_arguments
+
+    def parse_pycrown_args(self, file_context: Optional[list], arguments: Optional[dict]) -> dict:
+        valid_files = [
+            f for f in (file_context or [])
+            if Path(f.get("file_path") or "").suffix.lower() in (".las", ".laz", ".tif", ".tiff")
+            and os.path.isfile(f.get("file_path") or "")
+        ]
+        if not valid_files:
+            raise ValueError("请为 PyCrown 单木分割选择一份 LAS/LAZ 点云或 CHM/DSM/DTM GeoTIFF 文件。")
+
+        point_clouds = [f for f in valid_files if Path(f["file_path"]).suffix.lower() in (".las", ".laz")]
+        rasters = [f for f in valid_files if Path(f["file_path"]).suffix.lower() in (".tif", ".tiff")]
+
+        chm_file = None
+        dsm_file = None
+        dtm_file = None
+        for r in rasters:
+            name_lower = Path(r["file_path"]).name.lower()
+            if "dsm" in name_lower and dsm_file is None:
+                dsm_file = r["file_path"]
+            elif "dtm" in name_lower and dtm_file is None:
+                dtm_file = r["file_path"]
+            elif chm_file is None:
+                chm_file = r["file_path"]
+        if chm_file is None and rasters:
+            chm_file = rasters[0]["file_path"]
+
+        primary_file = chm_file or point_clouds[0]["file_path"]
+        point_cloud_path = point_clouds[0]["file_path"] if (chm_file and point_clouds) else None
+
+        arguments = arguments if isinstance(arguments, dict) else {}
+        sigma_m = arguments.get("sigma_m", 0.35)
+        min_distance_m = arguments.get("min_distance_m", 0.75)
+        min_height_m = arguments.get("min_height_m", 4.0)
+        min_canopy_height_m = arguments.get("min_canopy_height_m", 2.0)
+        crown_radius_m = arguments.get("crown_radius_m", 6.0)
+        chm_resolution_m = arguments.get("chm_resolution_m", 0.5)
+        use_pointcloud_supplement = arguments.get("use_pointcloud_supplement", True)
+        export_las = arguments.get("export_las", True)
+
+        if type(sigma_m) not in (int, float) or not 0 <= sigma_m <= float_info.max:
+            raise ValueError("平滑半径 sigma_m 必须是不小于 0 的数字（米）。")
+        if type(min_distance_m) not in (int, float) or not 0 < min_distance_m <= float_info.max:
+            raise ValueError("最小树顶间距 min_distance_m 必须是大于 0 的数字（米）。")
+        if type(min_height_m) not in (int, float) or not 0 <= min_height_m <= float_info.max:
+            raise ValueError("最小树顶高度 min_height_m 必须是不小于 0 的数字（米）。")
+        if type(min_canopy_height_m) not in (int, float) or not 0 <= min_canopy_height_m <= float_info.max:
+            raise ValueError("最小冠层高度 min_canopy_height_m 必须是不小于 0 的数字（米）。")
+        if min_height_m < min_canopy_height_m:
+            raise ValueError("最小树顶高度 min_height_m 不能小于最小冠层高度 min_canopy_height_m。")
+        if type(crown_radius_m) not in (int, float) or not 0 < crown_radius_m <= float_info.max:
+            raise ValueError("最大树冠半径 crown_radius_m 必须是大于 0 的数字（米）。")
+        if type(chm_resolution_m) not in (int, float) or not 0 < chm_resolution_m <= float_info.max:
+            raise ValueError("CHM 分辨率 chm_resolution_m 必须是大于 0 的数字（米）。")
+        if not isinstance(use_pointcloud_supplement, bool):
+            raise ValueError("use_pointcloud_supplement 必须为布尔值。")
+        if not isinstance(export_las, bool):
+            raise ValueError("export_las 必须为布尔值。")
+
+        tool_arguments = {
+            "file_path": primary_file,
+            "sigma_m": float(sigma_m),
+            "min_distance_m": float(min_distance_m),
+            "min_height_m": float(min_height_m),
+            "min_canopy_height_m": float(min_canopy_height_m),
+            "crown_radius_m": float(crown_radius_m),
+            "chm_resolution_m": float(chm_resolution_m),
+            "use_pointcloud_supplement": use_pointcloud_supplement,
+            "export_las": export_las,
+            "output_path": str(settings.RESULTS_DIR / uuid4().hex),
+        }
+        if dsm_file:
+            tool_arguments["dsm_path"] = dsm_file
+        if dtm_file:
+            tool_arguments["dtm_path"] = dtm_file
+        if point_cloud_path:
+            tool_arguments["point_cloud_path"] = point_cloud_path
         return tool_arguments
 
     def parse_tool_args(

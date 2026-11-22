@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from app.core.config import settings
 from app.models.database import MessageModel, db_service
 from app.services.agent_service import agent_service
-from app.services.mcp_service import NORMALS_TOOL
+from app.services.mcp_service import NORMALS_TOOL, PYCROWN_TOOL, WATERSHED_TOOL
 
 chat_router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -53,8 +53,16 @@ def normal_result_file(message: Optional[MessageModel]) -> Optional[Path]:
         return None
 
     results_dir = settings.RESULTS_DIR.resolve()
+    allowed_tools = {
+        NORMALS_TOOL: (".las",),
+        WATERSHED_TOOL: (".zip", ".tif", ".geojson", ".shp"),
+        PYCROWN_TOOL: (".zip", ".tif", ".gpkg", ".las"),
+    }
     for entry in tool_results:
-        if not isinstance(entry, dict) or entry.get("tool") != NORMALS_TOOL:
+        if not isinstance(entry, dict):
+            continue
+        tool_name = entry.get("tool")
+        if tool_name not in allowed_tools:
             continue
         result = entry.get("result")
         if not isinstance(result, dict) or result.get("status") != "success":
@@ -66,7 +74,7 @@ def normal_result_file(message: Optional[MessageModel]) -> Optional[Path]:
             path = Path(output_path).resolve(strict=True)
         except (OSError, RuntimeError, ValueError):
             continue
-        if path.is_relative_to(results_dir) and path.suffix.lower() == ".las" and path.is_file():
+        if path.is_relative_to(results_dir) and path.suffix.lower() in allowed_tools[tool_name] and path.is_file():
             return path
     return None
 
@@ -134,15 +142,17 @@ async def send_message(request: ChatRequest, http_request: Request):
 
     await db_service.update_session_title(session_id, extract_title(request.message))
 
-    normal_tool_used = any(entry.get("tool") == NORMALS_TOOL for entry in result.get("tool_results", []))
+    downloadable_tool_used = any(
+        entry.get("tool") in (NORMALS_TOOL, WATERSHED_TOOL, PYCROWN_TOOL) for entry in result.get("tool_results", [])
+    )
     return ChatResponse(
         session_id=session_id,
         message=result["content"],
         thoughts=result.get("thoughts", []),
         visualizations=result.get("visualizations", []),
         used_files=request.file_ids,
-        output_path=result.get("output_path") if normal_tool_used else None,
-        tool_data=result.get("tool_data") if normal_tool_used else None,
+        output_path=result.get("output_path") if downloadable_tool_used else None,
+        tool_data=result.get("tool_data") if downloadable_tool_used else None,
         download_url=normal_download_url(http_request, assistant_message),
     )
 

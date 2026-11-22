@@ -1,6 +1,6 @@
 from openai import AsyncOpenAI
 from app.core.config import settings
-from app.services.mcp_service import NORMALS_TOOL
+from app.services.mcp_service import NORMALS_TOOL, PYCROWN_TOOL, WATERSHED_TOOL
 from typing import AsyncIterator, Dict, Any, Optional, List
 import json
 import re
@@ -102,6 +102,28 @@ class LLMService:
                 "Omit parameters the user has not established. Convert units only when the "
                 "point cloud coordinate units are known. Never return input or output paths."
             )
+        watershed_instructions = ""
+        if WATERSHED_TOOL in tool_names:
+            watershed_instructions = (
+                " For a request to segment individual trees or tree crowns with watershed "
+                "(分水岭单木分割 / 树冠分割 / watershed segmentation), select segment_trees_watershed "
+                "and include an arguments object with any explicitly stated numerical parameters: "
+                "sigma_m (Gaussian smoothing sigma in metres, default 0.35), min_distance_m (minimum treetop "
+                "spacing in metres, default 0.75), min_canopy_height_m (minimum canopy height in metres, default 2.0), "
+                "chm_resolution_m (CHM resolution in metres, default 0.5), and use_pointcloud_supplement (boolean, default true)."
+            )
+        pycrown_instructions = ""
+        if PYCROWN_TOOL in tool_names:
+            pycrown_instructions = (
+                " For a request to segment individual trees or tree crowns with PyCrown / Dalponte "
+                "(PyCrown 单木分割 / Dalponte 树冠分割 / 陡坡树顶校正 / 首回波凸包树冠), select segment_trees_pycrown "
+                "and include an arguments object with any explicitly stated numerical parameters: "
+                "sigma_m (Gaussian smoothing sigma in metres, default 0.35), min_distance_m (minimum treetop "
+                "spacing in metres, default 0.75), min_height_m (minimum treetop height in metres, default 4.0), "
+                "min_canopy_height_m (minimum canopy height in metres, default 2.0), crown_radius_m (maximum crown "
+                "growth radius in metres, default 6.0), chm_resolution_m (CHM resolution in metres, default 0.5), "
+                "use_pointcloud_supplement (boolean, default true), and export_las (boolean, default true)."
+            )
         router_messages = [
             {
                 "role": "system",
@@ -111,6 +133,8 @@ class LLMService:
                     "If the user is asking a general question, or there is not enough information to execute a tool, choose null. "
                     'Return JSON only with "tool_name" and "reason", plus "arguments" when instructed. '
                     + normals_instructions
+                    + watershed_instructions
+                    + pycrown_instructions
                 ),
             },
             {
@@ -146,7 +170,7 @@ class LLMService:
                 "tool_name": tool_name,
                 "reason": data.get("reason", ""),
             }
-            if tool_name == NORMALS_TOOL:
+            if tool_name in (NORMALS_TOOL, WATERSHED_TOOL, PYCROWN_TOOL):
                 arguments = data.get("arguments")
                 selection["arguments"] = arguments if isinstance(arguments, dict) else {}
             return selection

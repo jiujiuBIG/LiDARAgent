@@ -3,7 +3,7 @@ import re
 from typing import Dict, Any, Optional, List, AsyncIterator
 from app.services.llm_service import llm_service
 from pydantic import BaseModel
-from app.services.mcp_service import NORMALS_TOOL, mcp_service
+from app.services.mcp_service import NORMALS_TOOL, PYCROWN_TOOL, WATERSHED_TOOL, mcp_service
 
 
 class AgentThought(BaseModel):
@@ -49,10 +49,12 @@ SYSTEM_PROMPT = """你是一个专业的林业生态分析助手，专注于森�
 - **extract_gap_fraction** - 林冠空隙率，计算冠层空隙比例
 - **extract_gini_coeff** - 基尼系数，衡量冠层内点的空间分布均匀程度
 
-### 遥感产品生成工具
+### 遥感产品生成与单木分割工具
 - **generate_dsm** - 数字表面模型（DSM），包含所有地物顶面的高程模型
 - **generate_dtm** - 数字地形模型（DTM），仅包含地形表面的高程模型
 - **generate_chm** - 冠层高度模型（CHM），树冠顶部相对于地面的高度
+- **segment_trees_watershed** - 分水岭单木树冠分割，支持 CHM 与三维点云树干-冠顶追踪补检，输出单木树冠栅格、矢量及树顶表
+- **segment_trees_pycrown** - PyCrown 单木树冠分割（Dalponte 圆形区域生长 + 3D 树干回溯补点 + 陡坡地形树顶校正 + 首回波点云凸包平滑与分类导出）
 
 ## 回复要求
 请用简洁专业的中文回复，包括：
@@ -141,6 +143,32 @@ def parse_tool_result_for_visualization(
             }
         )
 
+    elif tool_name == WATERSHED_TOOL:
+        visualizations.append(
+            {
+                "type": "statistic",
+                "title": "🌲 分水岭单木分割结果",
+                "data": {
+                    **tool_data,
+                    "output_file": output_path,
+                    "description": message[:300],
+                },
+            }
+        )
+
+    elif tool_name == PYCROWN_TOOL:
+        visualizations.append(
+            {
+                "type": "statistic",
+                "title": "🌲 PyCrown 单木分割结果",
+                "data": {
+                    **tool_data,
+                    "output_file": output_path,
+                    "description": message[:300],
+                },
+            }
+        )
+
     return visualizations
 
 
@@ -179,13 +207,16 @@ class AgentService:
                 }
             )
 
-            if tool_name == NORMALS_TOOL:
+            if tool_name in (NORMALS_TOOL, WATERSHED_TOOL, PYCROWN_TOOL):
                 tool_result = await mcp_service.call_tool(
                     tool_name, message, file_context, arguments=tool_call_info.get("arguments")
                 )
             else:
                 tool_result = await mcp_service.call_tool(tool_name, message, file_context)
             normal_error = tool_name == NORMALS_TOOL and tool_result.get("status") == "error"
+            watershed_error = tool_name == WATERSHED_TOOL and tool_result.get("status") == "error"
+            pycrown_error = tool_name == PYCROWN_TOOL and tool_result.get("status") == "error"
+            tool_error = normal_error or watershed_error or pycrown_error
             actual_arguments = {}
             if tool_name == NORMALS_TOOL and not normal_error:
                 normal_data = tool_result["data"]
@@ -193,6 +224,20 @@ class AgentService:
                     key: normal_data[key]
                     for key in ("radius", "max_nn", "orientation", "label_schema")
                     if key in normal_data
+                }
+            elif tool_name == WATERSHED_TOOL and not watershed_error:
+                ws_data = tool_result.get("data") or {}
+                actual_arguments = {
+                    key: ws_data[key]
+                    for key in ("sigma_m", "min_distance_m", "min_canopy_height_m", "chm_resolution_m", "pointcloud_supplement_used")
+                    if key in ws_data
+                }
+            elif tool_name == PYCROWN_TOOL and not pycrown_error:
+                pc_data = tool_result.get("data") or {}
+                actual_arguments = {
+                    key: pc_data[key]
+                    for key in ("sigma_m", "min_distance_m", "min_height_m", "min_canopy_height_m", "crown_radius_m", "chm_resolution_m", "pointcloud_supplement_used")
+                    if key in pc_data
                 }
             tool_results.append(
                 {
@@ -205,7 +250,11 @@ class AgentService:
             thoughts.append(
                 {
                     "step": "executing",
-                    "thought": "法向量估计未完成" if normal_error else f"✅ 工具 {tool_name} 执行完成",
+                    "thought": (
+                        "法向量估计未完成" if normal_error
+                        else ("分水岭分割未完成" if watershed_error
+                              else ("PyCrown 分割未完成" if pycrown_error else f"✅ 工具 {tool_name} 执行完成"))
+                    ),
                     "tool_calls": [tool_name],
                     "progress": 60,
                 }
@@ -227,7 +276,7 @@ class AgentService:
                 },
             ]
 
-            if normal_error:
+            if tool_error:
                 response = {"content": message_for_llm}
             else:
                 response = await llm_service.chat_complete(messages=messages)
@@ -235,7 +284,7 @@ class AgentService:
             thoughts.append(
                 {
                     "step": "completed",
-                    "thought": message_for_llm if normal_error else "分析完成",
+                    "thought": message_for_llm if tool_error else "分析完成",
                     "tool_calls": [tool_name],
                     "progress": 100,
                 }

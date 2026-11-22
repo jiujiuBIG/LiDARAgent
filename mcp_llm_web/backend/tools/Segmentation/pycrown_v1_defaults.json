@@ -1,0 +1,23 @@
+{
+  "smoothing_width_m": 0.35,
+  "peak_radius_m": 0.75,
+  "min_peak_m": 4.0,
+  "min_canopy_m": 2.0,
+  "min_final_tree_m": 4.0,
+  "seed_ratio": 0.0,
+  "mean_ratio": 0.0,
+  "crown_radius_m": 6.0,
+  "edge_buffer_m": 0.0,
+  "south_edge_buffer_m": null,
+  "max_smoothed_chm_m": null,
+  "reproduce_upstream_grid": false,
+  "smoothing_filter": "gaussian",
+  "min_terrain_std_m": 1.0,
+  "use_pointcloud_supplement": true,
+  "height_spacing_slope": 0.0,
+  "shoulder_dist_m": 5.0,
+  "shoulder_min_drop_m": 0.8,
+  "shoulder_min_h_diff_m": 3.0,
+  "shoulder_min_tall_h_m": 27.0,
+  "stem_candidate_radius_m": 1.5
+}

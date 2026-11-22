@@ -4,6 +4,8 @@ import json
 import subprocess
 import numpy as np
 import pandas as pd
+import rasterio
+from rasterio.transform import from_origin
 from mcp.server.fastmcp import FastMCP
 from tools.Preprocessing.read import read_point_cloud
 from tools.Preprocessing.utils import clean_point_cloud, get_xyz_array
@@ -114,13 +116,20 @@ async def generate_chm(
 
     min_x, min_y, _ = np.min(pc, axis=0)
     max_x, max_y, _ = np.max(pc, axis=0)
-    resolution = 0.5
+    resolution = float(resolution)
+    if not np.isfinite(resolution) or resolution <= 0:
+        return {
+            "status": "error",
+            "output_path": None,
+            "message": "网格分辨率必须为正数。",
+            "data": None,
+        }
 
     x_cells = int(np.ceil((max_x - min_x) / resolution)) + 1
     y_cells = int(np.ceil((max_y - min_y) / resolution)) + 1
 
-    row_indices = ((pc[:, 1] - min_y) / resolution).astype(int)  
-    col_indices = ((pc[:, 0] - min_x) / resolution).astype(int)  
+    row_indices = np.clip(((max_y - pc[:, 1]) / resolution).astype(int), 0, y_cells - 1)
+    col_indices = np.clip(((pc[:, 0] - min_x) / resolution).astype(int), 0, x_cells - 1)
 
     dsm_grid = np.full((y_cells, x_cells), -np.inf, dtype=np.float32)
 
@@ -140,8 +149,8 @@ async def generate_chm(
             "data": None,
         }
     
-    row_indices = ((ground[:, 1] - min_y) / resolution).astype(int)  
-    col_indices = ((ground[:, 0] - min_x) / resolution).astype(int)  
+    row_indices = np.clip(((max_y - ground[:, 1]) / resolution).astype(int), 0, y_cells - 1)
+    col_indices = np.clip(((ground[:, 0] - min_x) / resolution).astype(int), 0, x_cells - 1)
 
     dtm_grid = np.full((y_cells, x_cells), 99999, dtype=np.float32)
     for i in range(len(ground)):
@@ -157,7 +166,19 @@ async def generate_chm(
     os.makedirs(output_path, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(file_path))[0]
     output_tif = os.path.join(output_path, f"{base_name}_CHM.tif")
-    io.imsave(output_tif, chm_grid)
+    transform = from_origin(float(min_x), float(max_y), resolution, resolution)
+    with rasterio.open(
+        output_tif,
+        "w",
+        driver="GTiff",
+        height=chm_grid.shape[0],
+        width=chm_grid.shape[1],
+        count=1,
+        dtype="float32",
+        transform=transform,
+        compress="deflate",
+    ) as dst:
+        dst.write(chm_grid.astype(np.float32), 1)
 
     mean_height = np.nanmean(chm_grid)
     max_height = np.nanmax(chm_grid)

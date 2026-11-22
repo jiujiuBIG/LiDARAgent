@@ -1,1 +1,6 @@
 /llm_model/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+experiments/**/.demo_data/
+mcp_llm_web/backend/data/results/

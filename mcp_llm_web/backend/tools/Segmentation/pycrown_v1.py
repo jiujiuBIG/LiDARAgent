@@ -23,7 +23,10 @@ from scipy.spatial import ConvexHull, QhullError, cKDTree
 from shapely.geometry import Point, Polygon
 from skimage.filters import threshold_otsu
 
-from pycrown_pilot import DalponteSettings, crown_features, dalponte_labels
+try:
+    from tools.Segmentation.pycrown_pilot import DalponteSettings, crown_features, dalponte_labels
+except ImportError:
+    from pycrown_pilot import DalponteSettings, crown_features, dalponte_labels
 
 
 NEIGHBORS_2D = np.ones((3, 3), dtype=bool)

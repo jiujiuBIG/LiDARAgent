@@ -37,14 +37,15 @@ class LLMService:
                 "content": response.choices[0].message.content,
             }
 
-    async def chat_complete(
+    async def _chat_complete(
         self,
         messages: List[Dict[str, str]],
+        temperature: float = 0.7,
     ) -> Dict[str, Any]:
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=messages,
-            temperature=0.7,
+            temperature=temperature,
             stream=False,
         )
 
@@ -53,6 +54,12 @@ class LLMService:
             "content": message.content if message.content else "",
             "role": "assistant",
         }
+
+    async def chat_complete(
+        self,
+        messages: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        return await self._chat_complete(messages, temperature=0.7)
 
     async def select_tool(
         self,
@@ -90,7 +97,11 @@ class LLMService:
                 "estimate_point_cloud_normals even when the file or radius is missing; "
                 "the backend will ask for missing inputs. For that tool only, include an "
                 "arguments object with the numerical radius in the input XYZ coordinate units "
-                "and max_nn as an integer when specified. Omit orientation by default, including "
+                "and max_nn as an integer ONLY when explicitly specified by the user. "
+                "If the user has NOT explicitly stated a search radius, you MUST omit 'radius' "
+                "from arguments (return {} if no parameters were specified) and NEVER invent a "
+                "placeholder or default radius such as 1.0 or 0.25, even though radius is listed "
+                "as required in inputSchema. Omit orientation by default, including "
                 "when the user only mentions labelled data or a type of surface. Set orientation "
                 "to 'up' only for an explicit upward orientation request, or 'stem_outward' only "
                 "for an explicit request to orient stem normals outward. For 'stem_outward', "
@@ -129,8 +140,8 @@ class LLMService:
                 "role": "system",
                 "content": (
                     "You are a router for MCP tools in a LiDAR forestry analysis system. "
-                    "Choose exactly one tool only when the user clearly wants to run an available MCP tool. "
-                    "If the user is asking a general question, or there is not enough information to execute a tool, choose null. "
+                    "Choose exactly one tool only when the user clearly wants to run an available MCP tool on data. "
+                    "If the user is asking a general/conceptual question (such as asking for definitions, concepts, principles, or differences between terms like CHM and DSM), or there is not enough information to execute a tool, ALWAYS choose null — never select a data-processing tool just because it shares a keyword. "
                     'Return JSON only with "tool_name" and "reason", plus "arguments" when instructed. '
                     + normals_instructions
                     + watershed_instructions
@@ -152,8 +163,13 @@ class LLMService:
         ]
 
         try:
-            response = await self.chat_complete(router_messages)
+            if "chat_complete" in self.__dict__:
+                response = await self.chat_complete(router_messages)
+            else:
+                response = await self._chat_complete(router_messages, temperature=0.0)
             content = response.get("content", "").strip()
+            if "</think>" in content:
+                content = content.rsplit("</think>", 1)[-1].strip()
             match = re.search(r"\{.*\}", content, flags=re.S)
             data = json.loads(match.group(0) if match else content)
             tool_name = data.get("tool_name")
@@ -172,7 +188,14 @@ class LLMService:
             }
             if tool_name in (NORMALS_TOOL, WATERSHED_TOOL, PYCROWN_TOOL):
                 arguments = data.get("arguments")
-                selection["arguments"] = arguments if isinstance(arguments, dict) else {}
+                if isinstance(arguments, dict):
+                    arguments = {
+                        k: v for k, v in arguments.items()
+                        if k not in ("file_path", "output_path", "point_cloud_path", "dsm_path", "dtm_path")
+                    }
+                else:
+                    arguments = {}
+                selection["arguments"] = arguments
             return selection
         except Exception as e:
             return {

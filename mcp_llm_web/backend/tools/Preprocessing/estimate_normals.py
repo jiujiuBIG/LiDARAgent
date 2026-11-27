@@ -1,5 +1,7 @@
 import math
+import os
 from copy import deepcopy
+from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Annotated, Literal
@@ -23,7 +25,14 @@ NORMAL_DIMENSIONS = (
 )
 
 
-def estimate_normals(xyz: np.ndarray, radius: float, max_nn: int, orient_up: bool, query_indices=None):
+def estimate_normals(
+    xyz: np.ndarray,
+    radius: float,
+    max_nn: int,
+    orient_up: bool,
+    query_indices=None,
+    workers: int = -1,
+):
     queries = xyz if query_indices is None else xyz[query_indices]
     normals = np.zeros((len(queries), 3), dtype=np.float32)
     valid = np.zeros(len(queries), dtype=bool)
@@ -33,11 +42,12 @@ def estimate_normals(xyz: np.ndarray, radius: float, max_nn: int, orient_up: boo
 
     tree = cKDTree(xyz)
     k = min(max_nn, len(xyz) - 1) + 1
-    batch_size = min(1024, max(1, 65536 // k))
+    batch_size = min(16384, max(1024, 524288 // k))
+    query_k = min(k + 1, len(xyz))
     for start in range(0, len(queries), batch_size):
         end = min(start + batch_size, len(queries))
         query = queries[start:end]
-        distances, indices = tree.query(query, k=min(k + 1, len(xyz)))
+        distances, indices = tree.query(query, k=query_k, workers=workers)
         if k < len(xyz):
             ties = (distances[:, k] == distances[:, k - 1]) & (distances[:, k] <= radius)
             for row in np.flatnonzero(ties):
@@ -226,7 +236,7 @@ def process_tiled_file(
     with TemporaryDirectory(prefix="normal_tiles_", dir=output_file.parent) as folder:
         results = estimate_tiled_normals(
             source, Path(folder), radius, max_nn, orientation == "up", tile_size,
-            estimate_normals, fields, orient_stem_tree,
+            partial(estimate_normals, workers=1), fields, orient_stem_tree,
         )
         try:
             counts = write_tiled_output(source, output_file, header, dimensions, results, orientation)

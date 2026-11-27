@@ -10,6 +10,7 @@ import pytest
 import rasterio
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pyproj import CRS
 from rasterio.transform import from_origin
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -38,6 +39,7 @@ def _write_synthetic_las(path: Path):
     t2x, t2y, t2z = 500010.5 + dx, 6000010.5 + dy, 15.0 - 2.0 * radii
 
     header = laspy.LasHeader(point_format=0, version="1.2")
+    header.add_crs(CRS.from_epsg(25832))
     header.offsets = [500000.0, 6000000.0, 0.0]
     header.scales = [0.001, 0.001, 0.001]
     las = laspy.LasData(header)
@@ -84,6 +86,8 @@ def test_pycrown_tool_segments_synthetic_las_and_packs_outputs(tmp_path):
         "trees.las",
         "summary.json",
     }.issubset(names)
+    with laspy.open(out_dir / "trees.las") as output:
+        assert output.header.parse_crs().to_epsg() == 25832
 
 
 @pytest.mark.skipif(

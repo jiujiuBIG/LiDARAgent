@@ -1,6 +1,8 @@
 """Disk-backed XY tiling for point-cloud normal estimation."""
 
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import math
+import os
 from pathlib import Path
 
 import laspy
@@ -95,18 +97,45 @@ def estimate_tiled_normals(
     result = np.memmap(scratch / "normals.dat", mode="w+", dtype=RESULT_DTYPE, shape=(count,))
     result["oriented"] = False
     try:
-        # One extra tile is harmless and protects exact-radius cases on tile boundaries.
-        reach = math.ceil(radius / tile_size) + 1
-        for key, path in tiles.items():
+        # Exact reach: floor(radius / tile_size) + 1 covers exact-radius boundary cases
+        # without reading an unnecessary extra ring of tiles when radius < tile_size.
+        reach = int(math.floor(radius / tile_size)) + 1
+        max_workers = max(1, min(os.cpu_count() or 1, 8, len(tiles)))
+
+        def _process_tile(key, path):
             core = np.fromfile(path, dtype=ROW_DTYPE)
             parts = [core["xyz"], *halo_coordinates(key, tiles, scales, radius, tile_size, reach)]
             unique, inverse = np.unique(np.concatenate(parts), axis=0, return_inverse=True)
             queries, remap = np.unique(inverse.reshape(-1)[:len(core)], return_inverse=True)
             normals, valid, shortage = estimate(unique * scales, radius, max_nn, orient_up, queries)
-            rows = core["row"]
-            result["normals"][rows] = normals[remap]
-            result["valid"][rows] = valid[remap]
-            result["shortage"][rows] = shortage[remap]
+            return core["row"], normals[remap], valid[remap], shortage[remap]
+
+        if max_workers == 1:
+            for key, path in tiles.items():
+                rows, t_normals, t_valid, t_shortage = _process_tile(key, path)
+                result["normals"][rows] = t_normals
+                result["valid"][rows] = t_valid
+                result["shortage"][rows] = t_shortage
+        else:
+            tile_iter = iter(tiles.items())
+            max_in_flight = max_workers * 2
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                pending = set()
+                for _ in range(min(max_in_flight, len(tiles))):
+                    key, path = next(tile_iter)
+                    pending.add(pool.submit(_process_tile, key, path))
+                while pending:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        rows, t_normals, t_valid, t_shortage = fut.result()
+                        result["normals"][rows] = t_normals
+                        result["valid"][rows] = t_valid
+                        result["shortage"][rows] = t_shortage
+                        try:
+                            key, path = next(tile_iter)
+                            pending.add(pool.submit(_process_tile, key, path))
+                        except StopIteration:
+                            pass
 
         # Tree files collect all XY tiles so each height band uses a common stem axis.
         for path in stems.values():

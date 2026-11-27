@@ -1,7 +1,6 @@
 import os
 import sys
 import subprocess
-import torch
 
 CURRENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR))
@@ -16,7 +15,7 @@ from mcp.server.fastmcp import FastMCP
 from tools.Preprocessing.read import read_point_cloud
 from tools.Preprocessing.utils import clean_point_cloud, get_xyz_array
 import open3d as o3d
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, QhullError
 from tqdm import tqdm
 import cv2
 
@@ -32,6 +31,8 @@ def has_treeid(file_path: str) -> bool:
 
 def run_tree_segmentation(file_path: str, output_path: str) -> str:
     """运行单木分割，返回带有 treeid 的点云文件路径"""
+    import torch
+
     print(f"检测点云缺少 treeid，自动执行单木分割...")
     
     os.makedirs(output_path, exist_ok=True)
@@ -146,26 +147,30 @@ def denoise_point_cloud(
 
 def calculate_crown_ellipse_dimensions(points_3d: np.ndarray) -> dict:
     xy_points = points_3d[:, :2]
-    if xy_points.shape[0] < 2:
+    if xy_points.shape[0] < 5:
         return {"major_axis_length": 0.0, "minor_axis_length": 0.0}
-    hull = ConvexHull(xy_points)
-    hull_points = xy_points[hull.vertices]
-    hull_points_cv = hull_points.astype(np.float32)
-    if len(hull_points_cv) >= 5:
-        (center_x, center_y), (major_axis, minor_axis), angle = cv2.fitEllipse(
-            hull_points_cv
-        )
-        return {
-            "major_axis_length": major_axis / 2.0,
-            "minor_axis_length": minor_axis / 2.0,
-            "center_x": center_x,
-            "center_y": center_y,
-            "orientation": np.radians(angle),
-            "method": "opencv_convex_hull",
-            "convex_hull_area": hull.area,
-            "convex_hull_points": len(hull_points),
-        }
-    return {"major_axis_length": 0.0, "minor_axis_length": 0.0}
+
+    # Keep metre-scale crown geometry precise when OpenCV converts to float32.
+    origin = xy_points.mean(axis=0)
+    local_xy = xy_points - origin
+    hull = ConvexHull(local_xy)
+    if len(hull.vertices) < 5:
+        return {"major_axis_length": 0.0, "minor_axis_length": 0.0}
+
+    center, (width, height), angle = cv2.fitEllipse(local_xy[hull.vertices].astype(np.float32))
+    center_x, center_y = origin + center
+    major_axis, minor_axis = max(width, height), min(width, height)
+    major_angle = angle + (90.0 if height > width else 0.0)
+    return {
+        "major_axis_length": major_axis,
+        "minor_axis_length": minor_axis,
+        "center_x": float(center_x),
+        "center_y": float(center_y),
+        "orientation": float(np.radians(major_angle % 180.0)),
+        "method": "opencv_convex_hull",
+        "convex_hull_area": float(hull.volume),  # SciPy's 2D area is stored as volume.
+        "convex_hull_points": len(hull.vertices),
+    }
 
 
 mcp = FastMCP("TreeCrownAnalyzer")
@@ -175,47 +180,13 @@ mcp = FastMCP("TreeCrownAnalyzer")
     name="extract_tree_crown",
     description=(
         "Compute tree crown (canopy) dimensions for each individual tree in a forest point cloud. "
-        "Uses convex hull and ellipse fitting to calculate crown width, length, and orientation. "
+        "Fits an ellipse to the crown in XY and reports full major and minor axis lengths in metres. "
         "If the user does not provide the file_path, ask them to clarify it. "
         "If the user does not specify an output path, results will be saved in the current directory."
     ),
 )
 async def extract_tree_crown(file_path: str, output_path: str = "./") -> dict:
-    """
-    Read a classified forest point cloud (.las / .laz) and compute crown-related statistics for each tree.
-    Automatically performs tree segmentation if treeid is missing.
-
-    Parameters
-    ----------
-    file_path : str
-        Path to the input point cloud file (LAS or LAZ format).
-    output_path : str, optional
-        Directory to save the generated CSV results. Default is the current folder.
-
-    Returns
-    -------
-    dict: {
-        "status": "success" | "error",
-
-    # 检查是否需要单木分割
-    if not has_treeid(file_path):
-        print("点云缺少 treeid，自动执行单木分割...")
-        try:
-            segment_output = os.path.join(output_path, "segmentation")
-            file_path = run_tree_segmentation(file_path, segment_output)
-            print(f"单木分割完成，使用分割结果: {file_path}")
-        except Exception as e:
-            return {
-                "status": "error",
-                "output_path": None,
-                "message": f"自动单木分割失败: {e}",
-                "data": None
-            }
-        "output_path": str | None,
-        "message": str,
-        "data": dict | None
-    }
-    """
+    """Export crown statistics from an instance-labelled LAS or LAZ."""
     try:
         datasets = read_point_cloud(file_path, is_treeid=True)
         datasets = clean_point_cloud(datasets)
@@ -243,57 +214,64 @@ async def extract_tree_crown(file_path: str, output_path: str = "./") -> dict:
             "data": None,
         }
 
-    valid_mask = datasets["treeid"] != 0
+    valid_mask = datasets["treeid"] > 0
     datasets = datasets[valid_mask]
     xyz = datasets[["x", "y", "z"]].values
     treeid = datasets["treeid"].values
+    tree_ids = np.unique(treeid)
 
     results = []
-    for id in tqdm(np.unique(treeid)):
-        if id == 0:
+    for tree_id in tqdm(tree_ids):
+        index = treeid == tree_id
+        points = denoise_point_cloud(xyz[index])
+        if not len(points):
             continue
-        index = treeid == id
-        clipxyz = xyz[index]
-        denoise_points = denoise_point_cloud(clipxyz)
-        index = clipxyz[:, -1] >= np.percentile(clipxyz[:, -1], 30)
-        clipxyz = clipxyz[index]
-        if len(clipxyz) <= 3000:
+        crown_points = points[points[:, 2] >= np.percentile(points[:, 2], 30)]
+        if len(crown_points) <= 3000:
             continue
-        res = calculate_crown_ellipse_dimensions(denoise_points)
         try:
-            results.append(
-                {
-                    "treeid": int(id),
-                    "major_axis_length": res["major_axis_length"],
-                    "minor_axis_length": res["minor_axis_length"],
-                    "center_x": res["center_x"],
-                    "center_y": res["center_y"],
-                    "points_length": len(denoise_points),
-                }
-            )
-        except Exception:
+            res = calculate_crown_ellipse_dimensions(crown_points)
+        except (QhullError, cv2.error):
             continue
+        if "center_x" not in res:
+            continue
+        results.append({
+            "treeid": int(tree_id),
+            "major_axis_length": res["major_axis_length"],
+            "minor_axis_length": res["minor_axis_length"],
+            "center_x": res["center_x"],
+            "center_y": res["center_y"],
+            "points_length": len(crown_points),
+        })
 
     os.makedirs(output_path, exist_ok=True)
     output_csv = os.path.join(output_path, "TreeCrown.csv")
-    df = pd.DataFrame(results)
+    df = pd.DataFrame(results, columns=[
+        "treeid", "major_axis_length", "minor_axis_length", "center_x", "center_y", "points_length",
+    ])
     df.to_csv(output_csv, index=False)
 
-    if not df.empty:
-        mean_major = df["major_axis_length"].mean()
-        mean_minor = df["minor_axis_length"].mean()
-        max_major = df["major_axis_length"].max()
-        min_major = df["major_axis_length"].min()
-        var_major = df["major_axis_length"].var()
-    else:
-        mean_major = mean_minor = max_major = min_major = var_major = 0.0
+    skipped = len(tree_ids) - len(df)
+    if df.empty:
+        return {
+            "status": "warning",
+            "output_path": output_csv,
+            "message": "未拟合到冠幅。单木筛选后需要超过 3,000 点，且树冠投影须支持椭圆拟合。",
+            "data": {"tree_count": 0, "unmeasured_tree_count": skipped},
+        }
+
+    mean_major = float(df["major_axis_length"].mean())
+    max_major = float(df["major_axis_length"].max())
+    min_major = float(df["major_axis_length"].min())
+    var_major = float(df["major_axis_length"].var()) if len(df) > 1 else 0.0
 
     return {
         "status": "success",
         "output_path": output_csv,
-        "message": f"成功提取 {len(df)} 棵树的冠幅参数。平均冠幅长度: {mean_major:.2f}m，最大: {max_major:.2f}m，最小: {min_major:.2f}m。",
+        "message": f"已拟合 {len(df)} 棵树的冠幅，{skipped} 棵因点数不足或几何拟合失败跳过。平均冠幅长度为 {mean_major:.2f} 米。",
         "data": {
             "tree_count": len(df),
+            "unmeasured_tree_count": skipped,
             "crown_mean": round(mean_major, 2),
             "crown_max": round(max_major, 2),
             "crown_min": round(min_major, 2),

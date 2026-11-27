@@ -2,7 +2,6 @@ import os
 import sys
 import subprocess
 import laspy
-import torch
 
 CURRENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR))
@@ -13,7 +12,7 @@ import json
 import pandas as pd
 import numpy as np
 from mcp.server.fastmcp import FastMCP
-from tools.Preprocessing.read import read_point_cloud
+from tools.Preprocessing.read import HEIGHT_ABOVE_GROUND_FIELDS, read_point_cloud
 from tools.Preprocessing.utils import clean_point_cloud
 
 
@@ -28,6 +27,8 @@ def has_treeid(file_path: str) -> bool:
 
 def run_tree_segmentation(file_path: str, output_path: str) -> str:
     """运行单木分割，返回带有 treeid 的点云文件路径"""
+    import torch
+
     print(f"检测点云缺少 treeid，自动执行单木分割...")
     
     os.makedirs(output_path, exist_ok=True)
@@ -132,66 +133,29 @@ mcp = FastMCP("TreeHeightAnalyzer")
 @mcp.tool(
     name="extract_tree_height",
     description=(
-        "Compute tree height metrics for each individual tree in a forest point cloud. "
-        "If the user does not provide the file_path, ask them to clarify it"
-        "If the user does not specify an output path, results will be saved in the current directory."
+        "Compute vertical metrics for each tree in an instance-labelled LAS/LAZ in metres. "
+        "Report tree height only when the point cloud carries an explicit height-above-ground field."
     ),
 )
 async def extract_tree_height(file_path: str, output_path: str = "./") -> dict:
     """
-    Read a classified forest point cloud and compute height-related statistics for each tree.
-    Automatically performs tree segmentation if treeid is missing.
+    Export per-tree Z statistics and ground-relative height when available.
     """
     try:
-        datasets = read_point_cloud(file_path)
+        df_clean = clean_point_cloud(read_point_cloud(file_path))
     except Exception as e:
-        raise RuntimeError(f"Failed to read point cloud file: {file_path}. Error: {e}")
+        return {"status": "error", "output_path": None, "message": f"读取点云失败: {e}", "data": None}
 
-    # Clean and validate data
-    df_clean = clean_point_cloud(datasets)
+    if "treeid" not in df_clean:
+        return {"status": "error", "output_path": None, "message": "请提供带单木编号的 LAS 或 LAZ。", "data": None}
 
-    # Check for treeid
-    if "treeid" not in df_clean.columns:
-        print(
-            "Warning: No 'treeid' field found. Computing height statistics for all points instead."
-        )
-        # Compute overall height stats
-        z_values = df_clean["z"].values
-        max_h = np.max(z_values)
-        min_h = np.min(z_values)
-        mean_h = np.mean(z_values)
+    datasets = df_clean[df_clean["treeid"] > 0]
+    if datasets.empty:
+        return {"status": "error", "output_path": None, "message": "点云中没有有效的单木编号。", "data": None}
 
-        os.makedirs(output_path, exist_ok=True)
-        output_csv = os.path.join(output_path, "HeightStats.csv")
-        pd.DataFrame(
-            {
-                "metric": ["max_height", "min_height", "mean_height"],
-                "value": [float(max_h), float(min_h), float(mean_h)],
-            }
-        ).to_csv(output_csv, index=False)
-
-        summary = (
-            f"Successfully computed height statistics.\n"
-            f"Results saved to: {output_csv}\n"
-            f"Maximum height: {max_h:.2f} m\n"
-            f"Minimum height: {min_h:.2f} m\n"
-            f"Average height: {mean_h:.2f} m\n"
-            f"Note: No treeid field found. Computing statistics for all points."
-        )
-        return summary
-
-    # Check mandatory fields
-    if "z" not in df_clean.columns:
-        raise ValueError("The point cloud is missing required 'z' attribute.")
-
-    # Remove background points (treeid == 0)
-    valid_mask = df_clean["treeid"] != 0
-    datasets = df_clean[valid_mask]
-
-    if len(datasets) == 0:
-        raise ValueError("No valid tree points found after filtering (treeid == 0).")
-
-    # Compute per-tree height metrics
+    ground_height_field = next(
+        (name for name in HEIGHT_ABOVE_GROUND_FIELDS if name in datasets), None
+    )
     results = []
     for tid, group in datasets.groupby("treeid"):
         z_values = group["z"].values
@@ -200,20 +164,20 @@ async def extract_tree_height(file_path: str, output_path: str = "./") -> dict:
         h95 = np.percentile(z_values, 95)
         h05 = np.percentile(z_values, 5)
 
-        # if h95 - h05 < 1:
-        #     continue
-
-        results.append(
-            {
-                "treeid": int(tid),
-                "max_height": float(max_h),
-                "min_height": float(min_h),
-                "95th_height": float(h95),
-                "05th_height": float(h05),
-                "height_range": float(h95 - h05),
-                "n_points": len(z_values),
-            }
-        )
+        record = {
+            "treeid": int(tid),
+            "max_height": float(max_h),
+            "min_height": float(min_h),
+            "95th_height": float(h95),
+            "05th_height": float(h05),
+            "height_range": float(h95 - h05),
+            "n_points": len(z_values),
+        }
+        if ground_height_field is not None:
+            relative_heights = group[ground_height_field].to_numpy()
+            relative_heights = relative_heights[np.isfinite(relative_heights) & (relative_heights >= 0)]
+            record["tree_height_m"] = float(relative_heights.max()) if len(relative_heights) else None
+        results.append(record)
 
     result_df = pd.DataFrame(results).sort_values("treeid")
 
@@ -221,23 +185,23 @@ async def extract_tree_height(file_path: str, output_path: str = "./") -> dict:
     output_csv = os.path.join(output_path, "TreeHeight.csv")
     result_df.to_csv(output_csv, index=False)
 
-    if not result_df.empty:
-        mean_height = float(result_df["height_range"].mean())
-        var_height = float(result_df["height_range"].var())
-        max_height = float(result_df["height_range"].max())
-        min_height = float(result_df["height_range"].min())
+    mean_span = float(result_df["height_range"].mean())
+    data = {
+        "tree_count": len(result_df),
+        "vertical_span_mean_m": mean_span,
+        "height_above_ground_field": ground_height_field,
+    }
+    message = f"已计算 {len(result_df)} 棵树的 Z 值统计，平均垂直跨度（P95−P05）为 {mean_span:.2f} 米。"
+    if ground_height_field is not None:
+        heights = result_df["tree_height_m"].dropna()
+        data["tree_height_count"] = len(heights)
+        if len(heights):
+            data["tree_height_mean_m"] = float(heights.mean())
+            message += f"有 {len(heights)} 棵树可计算离地树高，平均为 {heights.mean():.2f} 米。"
     else:
-        mean_height = var_height = max_height = min_height = 0.0
+        message += "输入缺少离地高度字段，CSV 中的高程统计使用输入 Z 值。"
 
-    output_summary = (
-        f"Successfully extracted the height of each tree to {output_csv}.\n"
-        f"The average tree height in this area is {mean_height:.2f} m, with a variance of {var_height:.2f}.\n"
-        f"The tallest tree reaches {max_height:.2f} m, and the shortest tree is {min_height:.2f} m.\n"
-        f"Number of trees analyzed: {len(result_df)}.\n"
-        f"Please remember to check even if you just view it."
-    )
-
-    return output_summary
+    return {"status": "success", "output_path": output_csv, "message": message, "data": data}
 
 
 if __name__ == "__main__":

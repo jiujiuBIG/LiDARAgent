@@ -10,7 +10,13 @@ from pydantic import BaseModel
 from app.core.config import settings
 from app.models.database import MessageModel, db_service
 from app.services.agent_service import agent_service
-from app.services.mcp_service import NORMALS_TOOL, PYCROWN_TOOL, WATERSHED_TOOL
+from app.services.mcp_service import (
+    FOREST_PARAMETER_TOOLS,
+    NORMALS_TOOL,
+    PYCROWN_TOOL,
+    RASTER_PRODUCT_TOOLS,
+    WATERSHED_TOOL,
+)
 
 chat_router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -19,6 +25,7 @@ class ChatRequest(BaseModel):
     message: str
     session_id: str = None
     file_ids: List[str] = []
+    result_message_id: Optional[int] = None
 
 
 class ChatResponse(BaseModel):
@@ -30,6 +37,7 @@ class ChatResponse(BaseModel):
     output_path: Optional[str] = None
     tool_data: Optional[Dict] = None
     download_url: Optional[str] = None
+    reusable_result: Optional[Dict] = None
 
 
 class Message(BaseModel):
@@ -42,7 +50,16 @@ def extract_title(message: str) -> str:
     return message[:30] + "..." if len(message) > 30 else message
 
 
-def normal_result_file(message: Optional[MessageModel]) -> Optional[Path]:
+def normal_result_file(
+    message: Optional[MessageModel], tool_filter: Optional[str] = None
+) -> Optional[Path]:
+    result = downloadable_tool_result(message, tool_filter)
+    return result[0] if result is not None else None
+
+
+def downloadable_tool_result(
+    message: Optional[MessageModel], tool_filter: Optional[str] = None
+) -> Optional[tuple[Path, Dict]]:
     if message is None or message.role != "assistant" or not message.tool_results:
         return None
     try:
@@ -57,15 +74,20 @@ def normal_result_file(message: Optional[MessageModel]) -> Optional[Path]:
         NORMALS_TOOL: (".las",),
         WATERSHED_TOOL: (".zip", ".tif", ".geojson", ".shp"),
         PYCROWN_TOOL: (".zip", ".tif", ".gpkg", ".las"),
+        **{name: (".csv",) for name in FOREST_PARAMETER_TOOLS},
+        **{name: (".tif",) for name in RASTER_PRODUCT_TOOLS},
     }
     for entry in tool_results:
         if not isinstance(entry, dict):
             continue
         tool_name = entry.get("tool")
-        if tool_name not in allowed_tools:
+        if tool_name not in allowed_tools or (tool_filter is not None and tool_name != tool_filter):
             continue
         result = entry.get("result")
-        if not isinstance(result, dict) or result.get("status") != "success":
+        if not isinstance(result, dict):
+            continue
+        status = result.get("status")
+        if status != "success" and not (tool_name in FOREST_PARAMETER_TOOLS and status == "warning"):
             continue
         output_path = result.get("output_path")
         if not isinstance(output_path, str) or not output_path:
@@ -75,8 +97,55 @@ def normal_result_file(message: Optional[MessageModel]) -> Optional[Path]:
         except (OSError, RuntimeError, ValueError):
             continue
         if path.is_relative_to(results_dir) and path.suffix.lower() in allowed_tools[tool_name] and path.is_file():
-            return path
+            return path, result
     return None
+
+
+def sibling_result_file(output_path: Path, filename: str) -> Optional[Path]:
+    candidate = output_path.with_name(filename)
+    try:
+        if candidate.resolve(strict=True) == candidate and candidate.is_file():
+            return candidate
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return None
+
+
+def reusable_result_file(message: Optional[MessageModel]) -> Optional[tuple[Path, str]]:
+    normal_file = normal_result_file(message, NORMALS_TOOL)
+    if normal_file is not None:
+        return normal_file, "point_cloud"
+
+    legacy_crown = None
+    for tool in (PYCROWN_TOOL, WATERSHED_TOOL):
+        result = downloadable_tool_result(message, tool)
+        if result is None:
+            continue
+        path, tool_result = result
+        if tool == PYCROWN_TOOL and path.suffix.lower() == ".las":
+            legacy_crown = path
+        if path.suffix.lower() != ".zip":
+            continue
+
+        data = tool_result.get("data")
+        records_instance_export = isinstance(data, dict) and "point_instance_export" in data
+        if records_instance_export and data["point_instance_export"] is None:
+            continue
+        instance = sibling_result_file(path, "tree_instances.las")
+        if instance is not None:
+            return instance, "tree_instances"
+        if tool == PYCROWN_TOOL and not records_instance_export:
+            legacy_crown = sibling_result_file(path, "trees.las")
+
+    return (legacy_crown, "crown_points") if legacy_crown is not None else None
+
+
+def reusable_result_info(message: MessageModel) -> Optional[Dict]:
+    result = reusable_result_file(message)
+    if result is None:
+        return None
+    path, kind = result
+    return {"message_id": message.id, "filename": path.name, "kind": kind}
 
 
 def normal_download_url(request: Request, message: MessageModel) -> Optional[str]:
@@ -92,12 +161,27 @@ def normal_download_url(request: Request, message: MessageModel) -> Optional[str
 @chat_router.post("/send", response_model=ChatResponse)
 async def send_message(request: ChatRequest, http_request: Request):
     session_id = request.session_id or str(uuid.uuid4())
+    file_context = []
+    if request.result_message_id is not None:
+        if not request.session_id or request.file_ids:
+            raise HTTPException(status_code=400, detail="请选择当前会话的一份工具成果，或使用上传文件。")
+        previous_message = await db_service.get_message(session_id, request.result_message_id)
+        selected = reusable_result_file(previous_message)
+        if selected is None:
+            raise HTTPException(status_code=404, detail="所选工具成果不存在或无法用于续算。")
+        path, kind = selected
+        file_context.append({
+            "id": f"result:{request.result_message_id}",
+            "filename": path.name,
+            "file_type": path.suffix[1:].lower(),
+            "file_path": str(path),
+            "forest_input_kind": kind,
+        })
 
     session = await db_service.get_session(session_id)
     if not session:
         await db_service.create_session(session_id, extract_title(request.message))
 
-    file_context = []
     for file_id in request.file_ids:
         file_info = await db_service.get_file(file_id)
         if file_info:
@@ -143,17 +227,21 @@ async def send_message(request: ChatRequest, http_request: Request):
     await db_service.update_session_title(session_id, extract_title(request.message))
 
     downloadable_tool_used = any(
-        entry.get("tool") in (NORMALS_TOOL, WATERSHED_TOOL, PYCROWN_TOOL) for entry in result.get("tool_results", [])
+        entry.get("tool") in (
+            {NORMALS_TOOL, WATERSHED_TOOL, PYCROWN_TOOL} | FOREST_PARAMETER_TOOLS | RASTER_PRODUCT_TOOLS
+        )
+        for entry in result.get("tool_results", [])
     )
     return ChatResponse(
         session_id=session_id,
         message=result["content"],
         thoughts=result.get("thoughts", []),
         visualizations=result.get("visualizations", []),
-        used_files=request.file_ids,
+        used_files=[entry["id"] for entry in file_context],
         output_path=result.get("output_path") if downloadable_tool_used else None,
         tool_data=result.get("tool_data") if downloadable_tool_used else None,
         download_url=normal_download_url(http_request, assistant_message),
+        reusable_result=reusable_result_info(assistant_message),
     )
 
 
@@ -192,6 +280,7 @@ async def get_session(session_id: str, request: Request):
                 "content": m.content,
                 "timestamp": m.timestamp.isoformat(),
                 "download_url": normal_download_url(request, m),
+                "reusable_result": reusable_result_info(m),
             }
             for m in messages
         ],
@@ -205,7 +294,7 @@ async def download_normal_result(session_id: str, message_id: int):
     message = await db_service.get_message(session_id, message_id)
     path = normal_result_file(message)
     if path is None:
-        raise HTTPException(status_code=404, detail="法向量结果文件不存在或已不可用。")
+        raise HTTPException(status_code=404, detail="结果文件不存在或已不可用。")
     filename = path.name
     # Uploads keep a UUID4 storage prefix before the original filename.
     prefix, _, original_name = filename.partition("_")

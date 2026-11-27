@@ -1,6 +1,6 @@
 from openai import AsyncOpenAI
 from app.core.config import settings
-from app.services.mcp_service import NORMALS_TOOL, PYCROWN_TOOL, WATERSHED_TOOL
+from app.services.mcp_service import NORMALS_TOOL, PYCROWN_TOOL, RASTER_PRODUCT_TOOLS, WATERSHED_TOOL
 from typing import AsyncIterator, Dict, Any, Optional, List
 import json
 import re
@@ -98,6 +98,7 @@ class LLMService:
                 "the backend will ask for missing inputs. For that tool only, include an "
                 "arguments object with the numerical radius in the input XYZ coordinate units "
                 "and max_nn as an integer ONLY when explicitly specified by the user. "
+                "Include tile_size (XY tile width in the input coordinate units) only when the user explicitly gives a tile width. "
                 "If the user has NOT explicitly stated a search radius, you MUST omit 'radius' "
                 "from arguments (return {} if no parameters were specified) and NEVER invent a "
                 "placeholder or default radius such as 1.0 or 0.25, even though radius is listed "
@@ -186,7 +187,7 @@ class LLMService:
                 "tool_name": tool_name,
                 "reason": data.get("reason", ""),
             }
-            if tool_name in (NORMALS_TOOL, WATERSHED_TOOL, PYCROWN_TOOL):
+            if tool_name in (NORMALS_TOOL, WATERSHED_TOOL, PYCROWN_TOOL) or tool_name in RASTER_PRODUCT_TOOLS:
                 arguments = data.get("arguments")
                 if isinstance(arguments, dict):
                     arguments = {

@@ -32,6 +32,13 @@ from shapely.geometry import MultiPolygon, shape
 from skimage.measure import label as sk_label
 from skimage.segmentation import watershed
 
+if __package__:
+    from .point_instances import label_crown_and_stem_instances, label_traced_instances, las_height_above_ground, write_instance_cloud
+    from .spatial_inputs import require_metric_crs, validate_chm, validate_point_cloud_alignment
+else:
+    from point_instances import label_crown_and_stem_instances, label_traced_instances, las_height_above_ground, write_instance_cloud
+    from spatial_inputs import require_metric_crs, validate_chm, validate_point_cloud_alignment
+
 mcp = FastMCP("WatershedTreeCrownSegmentation")
 
 NEIGHBORS = np.ones((3, 3), dtype=bool)
@@ -95,13 +102,34 @@ def detect_treetops(
 
     chosen: list[int] = []
     min_distance_sq = float(min_distance_m) ** 2
+    ncols = values.shape[1]
+    inv_d = 1.0 / float(min_distance_m)
+    buckets: dict[tuple[int, int], list[tuple[float, float]]] = {}
     for cell, _ in candidates:
-        row, col = divmod(cell, values.shape[1])
-        if all(
-            ((row - other // values.shape[1]) * ry) ** 2 + ((col - other % values.shape[1]) * rx) ** 2 >= min_distance_sq
-            for other in chosen
-        ):
+        row, col = divmod(cell, ncols)
+        ym = row * ry
+        xm = col * rx
+        by = int(math.floor(ym * inv_d))
+        bx = int(math.floor(xm * inv_d))
+        too_close = False
+        for dby in (-1, 0, 1):
+            for dbx in (-1, 0, 1):
+                pts = buckets.get((by + dby, bx + dbx))
+                if pts is None:
+                    continue
+                for oy, ox in pts:
+                    dy = ym - oy
+                    dx = xm - ox
+                    if dy * dy + dx * dx < min_distance_sq:
+                        too_close = True
+                        break
+                if too_close:
+                    break
+            if too_close:
+                break
+        if not too_close:
             chosen.append(cell)
+            buckets.setdefault((by, bx), []).append((ym, xm))
 
     markers = np.zeros(values.shape, dtype=np.int32)
     for marker_id, cell in enumerate(sorted(chosen), start=1):
@@ -343,33 +371,69 @@ def supported_crown_tops(
     kernel = np.ones((3, 3), dtype=np.int32)
     result = {}
     start_level = int(SEED_TOP_M / VERTICAL_M)
-    nz = counts.shape[2]
-    for stem_id in range(len(stems)) if stem_ids is None else stem_ids:
-        belongs = owners == stem_id
-        levels = np.flatnonzero(np.any(belongs, axis=(0, 1)))
-        levels = levels[levels >= start_level]
-        if not len(levels):
+    ny, nx, nz = counts.shape
+    target_ids = list(range(len(stems)) if stem_ids is None else stem_ids)
+    if not target_ids or start_level >= nz or not len(stems):
+        return result
+
+    # Precompute exact XY bounding boxes for all target stems in a single pass.
+    lut = np.zeros(len(stems), dtype=bool)
+    lut[target_ids] = True
+    sub_owners = owners[..., start_level:]
+    occ_mask = sub_owners >= 0
+    r_all, c_all, _ = np.nonzero(occ_mask)
+    if not len(r_all):
+        return result
+    s_all = sub_owners[occ_mask]
+    keep_s = lut[s_all]
+    if not np.any(keep_s):
+        return result
+    r_all, c_all, s_all = r_all[keep_s], c_all[keep_s], s_all[keep_s]
+    order_s = np.argsort(s_all, kind="mergesort")
+    s_sorted = s_all[order_s]
+    r_sorted = r_all[order_s]
+    c_sorted = c_all[order_s]
+    uniq_s, split_pos = np.unique(s_sorted, return_index=True)
+    ends = np.append(split_pos[1:], len(s_sorted))
+    stem_bboxes = {}
+    for sid, st, en in zip(uniq_s.tolist(), split_pos.tolist(), ends.tolist()):
+        r0 = max(0, int(r_sorted[st:en].min()) - 1)
+        r1 = min(ny, int(r_sorted[st:en].max()) + 2)
+        c0 = max(0, int(c_sorted[st:en].min()) - 1)
+        c1 = min(nx, int(c_sorted[st:en].max()) + 2)
+        stem_bboxes[sid] = (r0, r1, c0, c1)
+
+    for stem_id in target_ids:
+        bbox = stem_bboxes.get(stem_id)
+        if bbox is None:
             continue
+        r0, r1, c0, c1 = bbox
+        local_owners = owners[r0:r1, c0:c1, start_level:]
+        local_counts = counts[r0:r1, c0:c1, start_level:]
+        belongs = local_owners == stem_id
         stem_x, stem_y = stems[stem_id]
 
         level_caps, level_core_caps, level_pts = {}, {}, {}
+        cap_cache = {}
         for lv in range(start_level, nz):
-            mask = belongs[..., lv]
+            rel = lv - start_level
+            mask = belongs[..., rel]
             if not mask.any():
                 level_caps[lv] = level_core_caps[lv] = level_pts[lv] = 0
                 continue
             cap = convolve(mask.astype(np.int32), kernel, mode="constant")
+            cap_cache[lv] = cap
             rows, cols = np.nonzero(mask & (cap >= min_cap_cells))
             if max_stem_offset_m is not None and len(rows):
-                x_e = origin[0] + (cols + 0.5) * HORIZONTAL_M
-                y_e = origin[1] + (rows + 0.5) * HORIZONTAL_M
+                x_e = origin[0] + (cols + c0 + 0.5) * HORIZONTAL_M
+                y_e = origin[1] + (rows + r0 + 0.5) * HORIZONTAL_M
                 keep = ((x_e - stem_x) ** 2 + (y_e - stem_y) ** 2) <= max_stem_offset_m ** 2
                 rows, cols = rows[keep], cols[keep]
             level_caps[lv] = int(cap[rows, cols].max()) if len(rows) else int(cap[mask].max())
-            level_pts[lv] = int(counts[..., lv][mask].sum())
+            level_pts[lv] = int(local_counts[..., rel][mask].sum())
             all_r, all_c = np.nonzero(mask)
-            x = origin[0] + (all_c + 0.5) * HORIZONTAL_M
-            y = origin[1] + (all_r + 0.5) * HORIZONTAL_M
+            x = origin[0] + (all_c + c0 + 0.5) * HORIZONTAL_M
+            y = origin[1] + (all_r + r0 + 0.5) * HORIZONTAL_M
             core_r = 0.55 if max_stem_offset_m is None else min(0.55, max_stem_offset_m)
             core = ((x - stem_x) ** 2 + (y - stem_y) ** 2) <= (core_r ** 2)
             level_core_caps[lv] = int(cap[all_r[core], all_c[core]].max()) if core.any() else 0
@@ -408,12 +472,12 @@ def supported_crown_tops(
         if max_stem_offset_m is not None:
             eligible_strong = []
             for slv in strong_lvs:
-                m_s = belongs[..., slv]
-                c_s = convolve(m_s.astype(np.int32), kernel, mode="constant")
+                m_s = belongs[..., slv - start_level]
+                c_s = cap_cache[slv]
                 r_s, col_s = np.nonzero(m_s & (c_s >= min_cap_cells))
                 if len(r_s):
-                    xs = origin[0] + (col_s + 0.5) * HORIZONTAL_M
-                    ys = origin[1] + (r_s + 0.5) * HORIZONTAL_M
+                    xs = origin[0] + (col_s + c0 + 0.5) * HORIZONTAL_M
+                    ys = origin[1] + (r_s + r0 + 0.5) * HORIZONTAL_M
                     if np.any((xs - stem_x) ** 2 + (ys - stem_y) ** 2 <= max_stem_offset_m ** 2):
                         eligible_strong.append(slv)
             if not eligible_strong:
@@ -427,11 +491,12 @@ def supported_crown_tops(
             if mid_lvs:
                 base_dx, base_dy = [], []
                 for mlv in mid_lvs:
-                    m_m = belongs[..., mlv]
+                    rel_m = mlv - start_level
+                    m_m = belongs[..., rel_m]
                     r_m, c_m = np.nonzero(m_m)
-                    w_m = np.maximum(counts[r_m, c_m, mlv].astype(float), 1.0)
-                    base_dx.append(float(np.sum((origin[0] + (c_m + 0.5) * HORIZONTAL_M - stem_x) * w_m) / np.sum(w_m)))
-                    base_dy.append(float(np.sum((origin[1] + (r_m + 0.5) * HORIZONTAL_M - stem_y) * w_m) / np.sum(w_m)))
+                    w_m = np.maximum(local_counts[r_m, c_m, rel_m].astype(float), 1.0)
+                    base_dx.append(float(np.sum((origin[0] + (c_m + c0 + 0.5) * HORIZONTAL_M - stem_x) * w_m) / np.sum(w_m)))
+                    base_dy.append(float(np.sum((origin[1] + (r_m + r0 + 0.5) * HORIZONTAL_M - stem_y) * w_m) / np.sum(w_m)))
                 ref_dx, ref_dy = float(np.median(base_dx)), float(np.median(base_dy))
             else:
                 ref_dx = ref_dy = 0.0
@@ -444,11 +509,12 @@ def supported_crown_tops(
                     running_max_pts = pts_here
                     peak_lv = slv
                 elif running_max_pts >= 1500 and (slv + 0.5) * VERTICAL_M >= 19.5 and slv > peak_lv and idx_s > 0:
-                    m_s = belongs[..., slv]
+                    rel_s = slv - start_level
+                    m_s = belongs[..., rel_s]
                     r_s, c_s = np.nonzero(m_s)
-                    w_s = np.maximum(counts[r_s, c_s, slv].astype(float), 1.0)
-                    dx_s = float(np.sum((origin[0] + (c_s + 0.5) * HORIZONTAL_M - stem_x) * w_s) / np.sum(w_s))
-                    dy_s = float(np.sum((origin[1] + (r_s + 0.5) * HORIZONTAL_M - stem_y) * w_s) / np.sum(w_s))
+                    w_s = np.maximum(local_counts[r_s, c_s, rel_s].astype(float), 1.0)
+                    dx_s = float(np.sum((origin[0] + (c_s + c0 + 0.5) * HORIZONTAL_M - stem_x) * w_s) / np.sum(w_s))
+                    dy_s = float(np.sum((origin[1] + (r_s + r0 + 0.5) * HORIZONTAL_M - stem_y) * w_s) / np.sum(w_s))
                     drift_reversed = (dx_s * ref_dx + dy_s * ref_dy) < -0.005
                     if pts_here <= running_max_pts * peak_drop_stop and drift_reversed:
                         lv = strong_lvs[idx_s - 1]
@@ -458,13 +524,14 @@ def supported_crown_tops(
         top_slice = [l for l in strong_lvs if abs(l - lv) <= 2 and l <= lv]
         all_x, all_y, all_w = [], [], []
         for l_idx in top_slice:
-            m_l = belongs[..., l_idx]
-            c_l = convolve(m_l.astype(np.int32), kernel, mode="constant")
+            rel_l = l_idx - start_level
+            m_l = belongs[..., rel_l]
+            c_l = cap_cache[l_idx]
             r_l, col_l = np.nonzero(m_l & (c_l >= min_cap_cells))
             if not len(r_l):
                 continue
-            x_l = origin[0] + (col_l + 0.5) * HORIZONTAL_M
-            y_l = origin[1] + (r_l + 0.5) * HORIZONTAL_M
+            x_l = origin[0] + (col_l + c0 + 0.5) * HORIZONTAL_M
+            y_l = origin[1] + (r_l + r0 + 0.5) * HORIZONTAL_M
             if max_stem_offset_m is not None:
                 keep = ((x_l - stem_x) ** 2 + (y_l - stem_y) ** 2) <= max_stem_offset_m ** 2
                 r_l, col_l, x_l, y_l = r_l[keep], col_l[keep], x_l[keep], y_l[keep]
@@ -472,7 +539,7 @@ def supported_crown_tops(
                 continue
             all_x.append(x_l)
             all_y.append(y_l)
-            all_w.append(np.maximum(counts[r_l, col_l, l_idx].astype(float), 1.0))
+            all_w.append(np.maximum(local_counts[r_l, col_l, rel_l].astype(float), 1.0))
 
         if not all_w:
             continue
@@ -533,6 +600,7 @@ def _fill_nearest(arr):
 def build_chm_and_normalized_cloud_from_las(source_path: Path, resolution: float = 0.5):
     """Build a 0.5 m CHM, DTM, transform, CRS, and normalized point cloud from LAS/LAZ."""
     las = laspy.read(source_path)
+    crs = require_metric_crs(las.header.parse_crs(), f"点云 {source_path.name}")
     x = np.asarray(las.x, dtype=float)
     y = np.asarray(las.y, dtype=float)
     z = np.asarray(las.z, dtype=float)
@@ -540,17 +608,20 @@ def build_chm_and_normalized_cloud_from_las(source_path: Path, resolution: float
         raise ValueError("输入点云为空。")
     dims = set(las.point_format.dimension_names)
     cls = np.asarray(las.classification, dtype=np.int32) if "classification" in dims else np.zeros(len(x), dtype=np.int32)
+    explicit_height = las_height_above_ground(las)
 
     minx, maxx = float(x.min()), float(x.max())
     miny, maxy = float(y.min()), float(y.max())
     shape = (int(np.ceil((maxy - miny) / resolution)) + 1, int(np.ceil((maxx - minx) / resolution)) + 1)
     transform = from_origin(minx, maxy, resolution, resolution)
-    crs = las.header.parse_crs()
-    crs_wkt = crs.to_wkt() if crs is not None else None
+    crs_wkt = crs.to_wkt()
+    del las
 
     dsm_raw = _grid_reduce(x, y, z, minx, maxy, resolution, shape, "max")
     ground_mask = cls == 2
-    if np.any(ground_mask):
+    del cls
+    has_classified_ground = bool(np.any(ground_mask))
+    if has_classified_ground:
         dtm_raw = _grid_reduce(x[ground_mask], y[ground_mask], z[ground_mask], minx, maxy, resolution, shape, "min")
         dtm = median_filter(_fill_nearest(dtm_raw), size=3, mode="nearest")
     elif float(np.percentile(z, 5)) >= -0.5 and float(np.percentile(z, 1)) <= 0.5:
@@ -558,6 +629,7 @@ def build_chm_and_normalized_cloud_from_las(source_path: Path, resolution: float
     else:
         dtm_raw = _grid_reduce(x, y, z, minx, maxy, resolution, shape, "min")
         dtm = median_filter(_fill_nearest(dtm_raw), size=3, mode="nearest")
+    del ground_mask
 
     occ = np.isfinite(dsm_raw)
     dist = distance_transform_edt(~occ, sampling=resolution)
@@ -568,17 +640,24 @@ def build_chm_and_normalized_cloud_from_las(source_path: Path, resolution: float
     chm[~np.isfinite(chm)] = 0.0
     chm[chm < 0] = 0.0
 
-    rows, cols = rasterio.transform.rowcol(transform, x, y)
-    rows = np.clip(rows, 0, shape[0] - 1)
-    cols = np.clip(cols, 0, shape[1] - 1)
-    norm_z = z - dtm[rows, cols]
+    cols = np.clip(np.floor((x - minx) / resolution).astype(np.int32), 0, shape[1] - 1)
+    rows = np.clip(np.floor((maxy - y) / resolution).astype(np.int32), 0, shape[0] - 1)
+    # Elevation heuristics may construct a 2-D CHM. Only measured ground
+    # classes or explicit point heights can establish a 3-D height reference.
+    if has_classified_ground:
+        norm_z = z - dtm[rows, cols]
+    elif explicit_height is not None:
+        norm_z = explicit_height
+    else:
+        norm_z = np.full_like(z, np.nan)
+    del rows, cols, z
     cloud = np.column_stack((x, y, norm_z))
-    valid_pts = np.isfinite(cloud).all(axis=1)
-    return chm.astype(np.float64), occ, transform, crs_wkt, (resolution, resolution), cloud[valid_pts]
+    del x, y, norm_z
+    return chm.astype(np.float64), occ, transform, crs_wkt, (resolution, resolution), cloud
 
 
-def supplement_treetops_from_cloud(baseline_points, cloud: np.ndarray):
-    """Supplement 2D CHM treetops with 3D stem-supported and upward-traced crown tops."""
+def supplement_treetops_from_cloud(baseline_points, cloud: np.ndarray, instance_evidence: dict | None = None):
+    """Supplement 2D CHM treetops and optionally keep 3D trace ownership."""
     if not len(cloud):
         return list(baseline_points), 0
     layer_grid, layer_origin = voxel_counts(cloud, 0.5, 0.5, 2.0)
@@ -587,22 +666,33 @@ def supplement_treetops_from_cloud(baseline_points, cloud: np.ndarray):
     run, density = stem_support_scores(low_grid, VERTICAL_M)
     stems = stem_positions(run, density, low_origin, HORIZONTAL_M, min_layers=7)
     paired = stem_supported_candidates(baseline_points, lower_candidates, stems, owner_radius=2.0, candidate_radius=1.25)
-    if not paired:
+    if not stems or (not paired and instance_evidence is None):
         return list(baseline_points), 0
-    stem_ids = [stem_id for _, stem_id in paired]
+    stem_ids = [stem_id for _, stem_id in paired] if instance_evidence is None else None
     grid, origin = voxel_counts(cloud, HORIZONTAL_M, VERTICAL_M, 1.5)
     owners = trace_owners(grid, origin, stems, radius_m=0.75, axis_weight=0.3, max_step_m=0.5, gap_levels=1, min_stem_layers=7)
     traced_tops = supported_crown_tops(grid, owners, origin, stems, min_cap_cells=7, stem_ids=stem_ids)
+    if instance_evidence is not None:
+        instance_evidence.update(owners=owners, origin=origin, tops=traced_tops, stems=stems)
     additions = [traced_tops.get(stem_id, fallback) for fallback, stem_id in paired]
     merged = merge_treetops(baseline_points, additions, distance_m=0.75, vertical_m=1.5)
     return merged, len(merged) - len(baseline_points)
 
 
 def write_crowns_vector(shp_path: Path, geojson_path: Path, labels: np.ndarray, heights: np.ndarray, treetops_by_id: dict, transform, crs, pixel_area: float):
-    ids, pixel_counts = np.unique(labels[labels > 0], return_counts=True)
+    pos_mask = labels > 0
+    pos_labels = labels[pos_mask]
+    ids, pixel_counts = np.unique(pos_labels, return_counts=True)
     pixels_per_tree = dict(zip(ids.tolist(), pixel_counts.tolist()))
+    max_id = int(ids[-1]) if len(ids) else 0
+    max_h_by_id = np.full(max_id + 1, -np.inf, dtype=np.float64)
+    if len(pos_labels):
+        pos_heights = heights[pos_mask]
+        valid_h = np.isfinite(pos_heights)
+        if np.any(valid_h):
+            np.maximum.at(max_h_by_id, pos_labels[valid_h], pos_heights[valid_h])
     records = []
-    for geometry, value in shapes(labels, mask=labels > 0, connectivity=4, transform=transform):
+    for geometry, value in shapes(labels, mask=pos_mask, connectivity=4, transform=transform):
         tree_id = int(value)
         polygon = shape(geometry)
         if not polygon.is_valid:
@@ -615,8 +705,8 @@ def write_crowns_vector(shp_path: Path, geojson_path: Path, labels: np.ndarray, 
             if not parts:
                 continue
             polygon = parts[0] if len(parts) == 1 else MultiPolygon(parts)
-        tree_mask = labels == tree_id
-        max_h = float(np.nanmax(heights[tree_mask])) if np.any(tree_mask) else 0.0
+        mh = max_h_by_id[tree_id] if tree_id <= max_id else -np.inf
+        max_h = float(mh) if np.isfinite(mh) else 0.0
         top_x, top_y, top_z, source_kind = treetops_by_id.get(tree_id, (polygon.centroid.x, polygon.centroid.y, max_h, "chm"))
         area_m2 = float(pixels_per_tree[tree_id] * pixel_area)
         diam_m = float(2.0 * math.sqrt(area_m2 / math.pi)) if area_m2 > 0 else 0.0
@@ -657,12 +747,15 @@ async def segment_trees_watershed(
     use_pointcloud_supplement: bool = True,
     point_cloud_path: str | None = None,
     output_path: str = "./",
+    export_las: bool = True,
 ) -> dict:
     """Segment individual tree crowns using marker-controlled watershed on CHM with 3D stem-to-crown treetop recovery.
 
     Accepts either a point cloud (.las/.laz) or a canopy height model GeoTIFF (.tif/.tiff).
     When a point cloud is provided (directly or via point_cloud_path), lower-canopy trees obscured in 2D CHM
     are recovered by verifying 1.5-6.5 m vertical stems and tracing upward with constriction and dome-drift truncation.
+    If LAS export is enabled, tree_instances.las preserves source points and appends point heights and
+    supported tree IDs. Unassigned points keep ID zero.
     """
     try:
         for val, label_name, allow_zero in (
@@ -682,23 +775,24 @@ async def segment_trees_watershed(
             raise ValueError("请选择 LAS/LAZ 点云或 TIF/TIFF 冠层高度图文件。")
 
         cloud = None
+        cloud_path = None
         if ext in (".las", ".laz"):
+            cloud_path = source
             heights, valid, transform, crs, resolution, cloud = build_chm_and_normalized_cloud_from_las(
                 source, float(chm_resolution_m)
             )
         else:
             with rasterio.Env(GDAL_PAM_ENABLED="NO"):
                 with rasterio.open(source, "r") as ds:
-                    if ds.count != 1:
-                        raise ValueError("请提供单波段冠层高度 GeoTIFF。")
+                    crs = validate_chm(ds)
+                    bounds = ds.bounds
                     raw = ds.read(1, masked=True).astype(np.float64)
                     raw = raw * ds.scales[0] + ds.offsets[0]
                     valid = ~np.ma.getmaskarray(raw) & np.isfinite(raw.data)
                     heights = np.where(valid, raw.data, 0.0)
                     transform = ds.transform
-                    crs = ds.crs
                     resolution = (abs(float(ds.res[0])), abs(float(ds.res[1])))
-            if use_pointcloud_supplement:
+            if use_pointcloud_supplement or (export_las and point_cloud_path is not None):
                 pc_candidate = Path(point_cloud_path) if point_cloud_path else None
                 if pc_candidate is None:
                     for sibling in ("cloud.laz", "cloud.las", f"{source.stem}.laz", f"{source.stem}.las"):
@@ -706,8 +800,10 @@ async def segment_trees_watershed(
                         if cand.is_file():
                             pc_candidate = cand
                             break
-                if pc_candidate is not None and pc_candidate.is_file():
+                if pc_candidate is not None:
+                    validate_point_cloud_alignment(pc_candidate, crs, bounds)
                     _, _, _, _, _, cloud = build_chm_and_normalized_cloud_from_las(pc_candidate, resolution[0])
+                    cloud_path = pc_candidate
 
         mask = valid & (heights >= float(min_canopy_height_m))
         chm_markers = detect_treetops(
@@ -728,8 +824,12 @@ async def segment_trees_watershed(
 
         supplemented_count = 0
         all_points = list(baseline_points)
-        if use_pointcloud_supplement and cloud is not None and len(cloud):
-            all_points, supplemented_count = supplement_treetops_from_cloud(baseline_points, cloud)
+        instance_evidence = {} if export_las else None
+        pointcloud_used = bool(use_pointcloud_supplement and cloud is not None and np.isfinite(cloud[:, 2]).any())
+        if pointcloud_used:
+            all_points, supplemented_count = supplement_treetops_from_cloud(
+                baseline_points, cloud, instance_evidence=instance_evidence,
+            )
 
         nrows, ncols = heights.shape
         markers = np.zeros((nrows, ncols), dtype=np.int32)
@@ -821,11 +921,33 @@ async def segment_trees_watershed(
             crown_areas = [r["area_m2"] for r in records]
             chm_seed_count = sum(1 for r in records if r["source"] == "chm")
             supplement_seed_count = sum(1 for r in records if r["source"] == "stem_to_crown_3d")
+            instance_export = None
+            if export_las and cloud_path is not None:
+                treetops = {
+                    record["tree_id"]: treetops_by_id[record["tree_id"]][:3]
+                    for record in records if pointcloud_used
+                }
+                traced = None
+                if instance_evidence and treetops:
+                    traced = label_traced_instances(
+                        cloud, instance_evidence["owners"], instance_evidence["origin"],
+                        HORIZONTAL_M, VERTICAL_M, instance_evidence["tops"], treetops,
+                    )
+                point_ids = label_crown_and_stem_instances(
+                    cloud, labels, transform, treetops, float(min_canopy_height_m),
+                    stem_positions=(instance_evidence or {}).get("stems", ()), traced_labels=traced,
+                    stem_top_m=SEED_TOP_M,
+                )
+                instance_export = write_instance_cloud(
+                    cloud_path, staging / "tree_instances.las", cloud[:, 2], point_ids,
+                    method="crown_raster_and_verified_stems",
+                )
 
             summary_data = {
                 "algorithm": "marker-controlled watershed + 3D stem-to-crown v9",
                 "input_type": "point_cloud" if ext in (".las", ".laz") else "chm_raster",
-                "pointcloud_supplement_used": bool(use_pointcloud_supplement and cloud is not None),
+                "pointcloud_supplement_used": pointcloud_used,
+                "point_instance_export": instance_export,
                 "tree_count": len(records),
                 "chm_seed_count": chm_seed_count,
                 "stem_supplemented_count": supplement_seed_count,
@@ -843,15 +965,20 @@ async def segment_trees_watershed(
             }
             (staging / "run.json").write_text(json.dumps(summary_data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-            for item in staging.iterdir():
+            written_files = []
+            for item in sorted(staging.iterdir()):
+                if not item.is_file():
+                    continue
                 target = out_dir / item.name
                 if not target.exists():
                     item.replace(target)
+                    written_files.append(target)
+                else:
+                    written_files.append(item)
 
             with zipfile.ZipFile(zip_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for item in sorted(out_dir.iterdir()):
-                    if item != zip_file and item.is_file():
-                        zf.write(item, arcname=item.name)
+                for item in written_files:
+                    zf.write(item, arcname=item.name)
 
         mode_desc = (
             f"（含 2D CHM 冠顶 {chm_seed_count} 棵 + 3D 树干冠顶追踪补检 {supplement_seed_count} 棵）"

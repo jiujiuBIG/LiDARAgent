@@ -14,6 +14,10 @@ from app.core.config import settings
 NORMALS_TOOL = "estimate_point_cloud_normals"
 WATERSHED_TOOL = "segment_trees_watershed"
 PYCROWN_TOOL = "segment_trees_pycrown"
+FOREST_PARAMETER_TOOLS = frozenset(
+    {"extract_tree_height", "extract_tree_crown", "extract_forest_dbh"}
+)
+RASTER_PRODUCT_TOOLS = frozenset({"generate_dsm", "generate_dtm", "generate_chm"})
 
 # TOOL_TRIGGERS = {
 #     "read_point_cloud": ["读取点云", "加载点云", "打开点云", "read point cloud", "load point cloud", "open point cloud"],
@@ -165,6 +169,8 @@ class MCPService:
                 args = self.parse_watershed_args(file_context, arguments)
             elif tool_name == PYCROWN_TOOL:
                 args = self.parse_pycrown_args(file_context, arguments)
+            elif tool_name in RASTER_PRODUCT_TOOLS:
+                args = self.parse_raster_product_args(tool_name, file_context, arguments)
             else:
                 args = self.parse_tool_args(tool_name, query, input_schema, file_context)
         except ValueError as exc:
@@ -174,9 +180,10 @@ class MCPService:
             result = await session.call_tool(tool_name, args)
             raw_result = result.content[0].text if result.content else "{}"
 
+            if getattr(result, "isError", False):
+                raise ValueError(raw_result)
+
             if tool_name in (NORMALS_TOOL, WATERSHED_TOOL, PYCROWN_TOOL):
-                if getattr(result, "isError", False):
-                    raise ValueError(raw_result)
                 parsed = json.loads(raw_result)
                 if not isinstance(parsed, dict) or parsed.get("status") not in ("success", "error"):
                     raise ValueError("工具返回了无法解析的结果。")
@@ -184,14 +191,16 @@ class MCPService:
 
             try:
                 parsed = json.loads(raw_result)
-                return parsed
             except json.JSONDecodeError:
-                return {
-                    "status": "success",
-                    "output_path": None,
-                    "message": raw_result,
-                    "data": None,
-                }
+                parsed = raw_result
+            if isinstance(parsed, dict):
+                return parsed
+            return {
+                "status": "success",
+                "output_path": None,
+                "message": parsed if isinstance(parsed, str) else raw_result,
+                "data": None,
+            }
         except Exception as e:
             return {
                 "status": "error",
@@ -240,6 +249,11 @@ class MCPService:
             "orientation": orientation,
             "output_path": str(settings.RESULTS_DIR / uuid4().hex),
         }
+        tile_size = arguments.get("tile_size")
+        if tile_size is not None:
+            if type(tile_size) not in (int, float) or not 0 < tile_size <= float_info.max:
+                raise ValueError("分块宽度 tile_size 必须为有限的正数，并使用点云坐标的单位。")
+            tool_arguments["tile_size"] = float(tile_size)
         if orientation == "stem_outward":
             label_schema = arguments.get("label_schema")
             if label_schema not in ("forinstance", "nibio_mls"):
@@ -247,20 +261,36 @@ class MCPService:
             tool_arguments["label_schema"] = label_schema
         return tool_arguments
 
+    def select_segmentation_inputs(self, file_context: Optional[list]) -> dict[str, str]:
+        inputs = {}
+        for file in file_context or []:
+            path = Path(file.get("file_path") or "")
+            suffix = path.suffix.lower()
+            if suffix not in (".las", ".laz", ".tif", ".tiff"):
+                continue
+            filename = Path(file.get("filename") or path.name)
+            if not path.is_file():
+                raise ValueError(f"所选文件不可用：{filename.name}")
+            if suffix in (".las", ".laz"):
+                role = "point_cloud"
+            else:
+                roles = set(re.findall(r"(?<![a-z])(chm|dsm|dtm)(?![a-z])", filename.stem.lower()))
+                if len(roles) != 1:
+                    raise ValueError(f"无法确认 {filename.name} 的栅格角色。请在文件名中标明 CHM、DSM 或 DTM。")
+                role = roles.pop()
+            if role in inputs:
+                label = "LAS/LAZ" if role == "point_cloud" else role.upper()
+                raise ValueError(f"选中了多份 {label}，请为当前任务只保留一份。")
+            inputs[role] = str(path)
+        if not inputs or ("chm" not in inputs and ("dsm" in inputs or "dtm" in inputs)):
+            raise ValueError("请选择带 CHM 标识的冠层高度 GeoTIFF，或只选择一份 LAS/LAZ 点云。")
+        return inputs
+
     def parse_watershed_args(self, file_context: Optional[list], arguments: Optional[dict]) -> dict:
-        valid_files = [
-            f for f in (file_context or [])
-            if Path(f.get("file_path") or "").suffix.lower() in (".las", ".laz", ".tif", ".tiff")
-            and os.path.isfile(f.get("file_path") or "")
-        ]
-        if not valid_files:
-            raise ValueError("请为分水岭单木分割选择一份 LAS/LAZ 点云或 TIF/TIFF 冠层高度图文件。")
-
-        point_clouds = [f for f in valid_files if Path(f["file_path"]).suffix.lower() in (".las", ".laz")]
-        rasters = [f for f in valid_files if Path(f["file_path"]).suffix.lower() in (".tif", ".tiff")]
-
-        primary_file = (rasters[0] if rasters else point_clouds[0])["file_path"]
-        point_cloud_path = point_clouds[0]["file_path"] if (rasters and point_clouds) else None
+        inputs = self.select_segmentation_inputs(file_context)
+        chm_file = inputs.get("chm")
+        primary_file = chm_file or inputs["point_cloud"]
+        point_cloud_path = inputs.get("point_cloud") if chm_file else None
 
         arguments = arguments if isinstance(arguments, dict) else {}
         sigma_m = arguments.get("sigma_m", 0.35)
@@ -294,33 +324,14 @@ class MCPService:
         return tool_arguments
 
     def parse_pycrown_args(self, file_context: Optional[list], arguments: Optional[dict]) -> dict:
-        valid_files = [
-            f for f in (file_context or [])
-            if Path(f.get("file_path") or "").suffix.lower() in (".las", ".laz", ".tif", ".tiff")
-            and os.path.isfile(f.get("file_path") or "")
-        ]
-        if not valid_files:
-            raise ValueError("请为 PyCrown 单木分割选择一份 LAS/LAZ 点云或 CHM/DSM/DTM GeoTIFF 文件。")
-
-        point_clouds = [f for f in valid_files if Path(f["file_path"]).suffix.lower() in (".las", ".laz")]
-        rasters = [f for f in valid_files if Path(f["file_path"]).suffix.lower() in (".tif", ".tiff")]
-
-        chm_file = None
-        dsm_file = None
-        dtm_file = None
-        for r in rasters:
-            name_lower = Path(r["file_path"]).name.lower()
-            if "dsm" in name_lower and dsm_file is None:
-                dsm_file = r["file_path"]
-            elif "dtm" in name_lower and dtm_file is None:
-                dtm_file = r["file_path"]
-            elif chm_file is None:
-                chm_file = r["file_path"]
-        if chm_file is None and rasters:
-            chm_file = rasters[0]["file_path"]
-
-        primary_file = chm_file or point_clouds[0]["file_path"]
-        point_cloud_path = point_clouds[0]["file_path"] if (chm_file and point_clouds) else None
+        inputs = self.select_segmentation_inputs(file_context)
+        chm_file = inputs.get("chm")
+        dsm_file = inputs.get("dsm")
+        dtm_file = inputs.get("dtm")
+        if dsm_file is not None and dtm_file is None:
+            raise ValueError("为 PyCrown 提供 DSM 时，请同时选择同一网格的 DTM。")
+        primary_file = chm_file or inputs["point_cloud"]
+        point_cloud_path = inputs.get("point_cloud") if chm_file else None
 
         arguments = arguments if isinstance(arguments, dict) else {}
         sigma_m = arguments.get("sigma_m", 0.35)
@@ -371,9 +382,63 @@ class MCPService:
             tool_arguments["point_cloud_path"] = point_cloud_path
         return tool_arguments
 
+    def parse_raster_product_args(
+        self, tool_name: str, file_context: Optional[list], arguments: Optional[dict]
+    ) -> dict:
+        if len(file_context or []) != 1:
+            raise ValueError("请为栅格产品生成选择一份点云文件。")
+        file_path = file_context[0].get("file_path") or ""
+        if Path(file_path).suffix.lower() not in (".las", ".laz", ".ply", ".txt", ".bin") or not os.path.isfile(file_path):
+            raise ValueError("选中的点云文件不可用，请重新上传或选择。")
+
+        arguments = arguments if isinstance(arguments, dict) else {}
+        tool_arguments: Dict[str, Any] = {
+            "file_path": file_path,
+            "output_path": str(settings.RESULTS_DIR / uuid4().hex),
+        }
+        resolution = arguments.get("resolution")
+        if resolution is not None:
+            if type(resolution) not in (int, float) or not 0 < resolution <= float_info.max:
+                raise ValueError("网格分辨率 resolution 必须为有限的正数（米）。")
+            tool_arguments["resolution"] = float(resolution)
+
+        input_crs = arguments.get("input_crs")
+        if input_crs is not None:
+            if not isinstance(input_crs, str) or not input_crs.strip():
+                raise ValueError("坐标系 input_crs 必须是非空字符串，例如 EPSG:32650。")
+            tool_arguments["input_crs"] = input_crs.strip()
+
+        if tool_name in ("generate_dtm", "generate_chm"):
+            cloth_resolution = arguments.get("cloth_resolution")
+            if cloth_resolution is not None:
+                if type(cloth_resolution) not in (int, float) or not 0 < cloth_resolution <= float_info.max:
+                    raise ValueError("布料分辨率 cloth_resolution 必须为有限的正数（米）。")
+                tool_arguments["cloth_resolution"] = float(cloth_resolution)
+
+        return tool_arguments
+
     def parse_tool_args(
         self, tool_name: str, query: str, input_schema: Dict, file_context: list = None
     ) -> Dict:
+        if tool_name in FOREST_PARAMETER_TOOLS:
+            if len(file_context or []) != 1:
+                raise ValueError("请为森林参数提取选择一份已分割的 LAS 或 LAZ。")
+            if tool_name == "extract_forest_dbh" and file_context[0].get("forest_input_kind") == "crown_points":
+                raise ValueError("该成果只包含用于树冠提取的点。胸径需要保留树干点、已按地面归一化的单木点云。")
+            file_path = file_context[0].get("file_path") or ""
+            if Path(file_path).suffix.lower() not in (".las", ".laz") or not os.path.isfile(file_path):
+                raise ValueError("所选 LAS 或 LAZ 不可用，请重新上传或选择。")
+            forest_arguments = {
+                "file_path": file_path,
+                "output_path": str(settings.RESULTS_DIR / uuid4().hex),
+            }
+            if tool_name == "extract_forest_dbh" and re.match(
+                r"^(?:我)?确认\s*Z\s*(?:值\s*)?已\s*按地面\s*归一化(?=$|[\s，。；,.])",
+                query.strip(), flags=re.IGNORECASE,
+            ):
+                forest_arguments["z_is_normalized"] = True
+            return forest_arguments
+
         args = {}
 
         if file_context:
@@ -397,30 +462,18 @@ class MCPService:
                         args["file_path"] = file_path
                         break
 
-        if tool_name == "extract_forest_dbh" and "file_path" in args:
-            args.setdefault("output_path", "./")
-
-        elif tool_name == "extract_tree_height" and "file_path" in args:
-            args.setdefault("output_path", "./")
-
-        elif tool_name == "extract_tree_crown" and "file_path" in args:
-            args.setdefault("output_path", "./")
-
         # elif tool_name == "compute_diversity_index" and "file_path" in args:
         #     args.setdefault("output_path", "./")
 
-        elif (
+        if (
             tool_name
             in ["extract_filling_index", "extract_lai", "extract_top_rugosity", "extract_rumple_index", "extract_fhd"]
             and "file_path" in args
         ):
             args.setdefault("output_path", "./")
 
-        elif (
-            tool_name in ["generate_dsm", "generate_dtm", "generate_chm"]
-            and "file_path" in args
-        ):
-            args.setdefault("output_path", "./")
+        elif tool_name in RASTER_PRODUCT_TOOLS and "file_path" in args:
+            args["output_path"] = str(settings.RESULTS_DIR / uuid4().hex)
 
         elif tool_name == "extract_individual_trees" and "file_path" in args:
             args.setdefault("output_path", "./")

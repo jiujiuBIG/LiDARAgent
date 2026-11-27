@@ -12,12 +12,11 @@ import pandas as pd
 import numpy as np
 import laspy
 from mcp.server.fastmcp import FastMCP
-from tools.Preprocessing.read import read_point_cloud
+from tools.Preprocessing.read import HEIGHT_ABOVE_GROUND_FIELDS, read_point_cloud
+from tools.Segmentation.point_instances import BREAST_HEIGHT_MAX, BREAST_HEIGHT_MIN
 from tools.Preprocessing.utils import clean_point_cloud
 from tools.Preprocessing.write import dataframe_to_las
-from skimage.transform import hough_circle, hough_circle_peaks
-from skimage.feature import canny
-import torch
+from scipy.optimize import least_squares
 
 
 def has_treeid(file_path: str) -> bool:
@@ -36,6 +35,8 @@ def has_treeid(file_path: str) -> bool:
 
 def run_tree_segmentation(file_path: str, output_path: str) -> str:
     """运行单木分割，返回带有 treeid 的点云文件路径"""
+    import torch
+
     print(f"🔍 检测到点云缺少 treeid，正在自动执行单木分割...")
 
     os.makedirs(output_path, exist_ok=True)
@@ -164,8 +165,10 @@ def fit_circle_least_squares(xy: np.ndarray):
     b = Z
 
     try:
-        params, *_ = np.linalg.lstsq(A, b, rcond=None)
+        params, _, rank, _ = np.linalg.lstsq(A, b, rcond=None)
     except np.linalg.LinAlgError:
+        return None, None, None, None, n
+    if rank < 3:
         return None, None, None, None, n
 
     a, b_param, c = params
@@ -189,86 +192,172 @@ def fit_circle_least_squares(xy: np.ndarray):
     return cx, cy, r, r2, n
 
 
-def process_one_file_hough(
-    xyz, treeid, z_min=1.2, z_max=1.25, canny_sigma=2.0, hough_threshold=0.1
-):
-    # --------------------
-    #  1. 选取胸高截面
-    # --------------------
-    clipindex = (xyz[:, 2] >= z_min) & (xyz[:, 2] <= z_max)
-    clipxyz = xyz[clipindex][:, :2]
-    cliptreeid = treeid[clipindex]
+MIN_DBH_POINTS = 20
+DBH_INLIER_TOLERANCE_M = 0.03
+DBH_MIN_RADIUS_M = 0.04
+DBH_MAX_RADIUS_M = 5.0
+BREAST_HEIGHT_M = 1.3
+STEM_BAND_HALF_HEIGHT_M = 0.5
+STEM_BAND_INLIER_TOLERANCE_M = 0.04
+MIN_STEM_SIDE_POINTS = 8
+MAX_STEM_EVIDENCE_GAP_M = 0.55
 
+
+def fit_stem_section(xy: np.ndarray):
+    """Fit directly to returns, retaining partial arcs and rejecting weak circles."""
+    origin = xy.mean(axis=0)
+    points = xy - origin
+    rng = np.random.default_rng(0)
+    sample = points if len(points) <= 1024 else points[rng.choice(len(points), 1024, replace=False)]
+    triples = sample[rng.integers(len(sample), size=(256, 3))]
+    a = triples[:, 1] - triples[:, 0]
+    b = triples[:, 2] - triples[:, 0]
+    cross = a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
+    stable = np.abs(cross) > 1e-4
+    a, b, cross = a[stable], b[stable], cross[stable]
+    aa, bb = (a * a).sum(axis=1), (b * b).sum(axis=1)
+    offsets = np.column_stack((aa * b[:, 1] - bb * a[:, 1], bb * a[:, 0] - aa * b[:, 0]))
+    offsets /= 2 * cross[:, None]
+    centres = offsets + triples[stable, 0]
+    radii = np.linalg.norm(offsets, axis=1)
+    cx, cy, radius, _, _ = fit_circle_least_squares(sample)
+    if radius is not None:
+        centres = np.vstack((centres, [cx, cy]))
+        radii = np.append(radii, radius)
+    valid = (radii >= DBH_MIN_RADIUS_M) & (radii <= DBH_MAX_RADIUS_M)
+    centres, radii = centres[valid], radii[valid]
+    if not len(radii):
+        return None
+
+    residuals = np.abs(np.linalg.norm(sample[None, :, :] - centres[:, None, :], axis=2) - radii[:, None])
+    # Cap the loss so distant returns do not dominate the candidate selection.
+    best = np.argmin(np.minimum(residuals, DBH_INLIER_TOLERANCE_M).mean(axis=1))
+    start = np.r_[centres[best], radii[best]]
+
+    def radial_error(params, data):
+        return np.linalg.norm(data - params[:2], axis=1) - params[2]
+
+    minimum_support = max(12, int(np.ceil(len(points) * 0.55)))
+    consensus = np.abs(radial_error(start, points)) <= DBH_INLIER_TOLERANCE_M
+    if np.count_nonzero(consensus) < minimum_support:
+        return None
+    fit = least_squares(
+        radial_error, start, args=(points[consensus],), loss="soft_l1", f_scale=0.01,
+        bounds=([-np.inf, -np.inf, DBH_MIN_RADIUS_M], [np.inf, np.inf, DBH_MAX_RADIUS_M]),
+    )
+    errors = radial_error(fit.x, points)
+    support = np.abs(errors) <= DBH_INLIER_TOLERANCE_M
+    count = int(np.count_nonzero(support))
+    if not fit.success or count < minimum_support:
+        return None
+
+    relative = points[support] - fit.x[:2]
+    angles = np.sort(np.arctan2(relative[:, 1], relative[:, 0]))
+    arc = 2 * np.pi - np.diff(np.r_[angles, angles[0] + 2 * np.pi]).max()
+    if arc < np.pi / 2:
+        return None
+
+    _, _, _, score, _ = fit_circle_least_squares(points[support])
+    return {
+        "circle_id": 0, "n_points": count,
+        "cx": float(fit.x[0] + origin[0]), "cy": float(fit.x[1] + origin[1]),
+        "radius": float(fit.x[2]), "DBH": float(2 * fit.x[2]), "r2": score, "vote": np.nan,
+        "inlier_fraction": count / len(points),
+        "fit_rmse_m": float(np.sqrt(np.mean(errors[support] ** 2))),
+        "arc_degrees": float(np.degrees(arc)),
+    }
+
+
+def fit_dbh_sections(xyz, treeid):
+    clip = (xyz[:, 2] >= BREAST_HEIGHT_MIN) & (xyz[:, 2] <= BREAST_HEIGHT_MAX)
+    xy, ids = xyz[clip, :2], treeid[clip]
+    order = np.argsort(ids, kind="stable")
+    ids, starts = np.unique(ids[order], return_index=True)
     results = []
-
-    for id in np.unique(cliptreeid):
-        if id == 0:
+    for tree_id, start, stop in zip(ids, starts, np.r_[starts[1:], len(order)]):
+        if tree_id <= 0 or stop - start < MIN_DBH_POINTS:
             continue
-        index = cliptreeid == id
-        pts = clipxyz[index]
+        circle = fit_stem_section(xy[order[start:stop]])
+        if circle is not None:
+            results.append({"treeid": tree_id, **circle})
+    return pd.DataFrame(results)
 
-        res = 0.01
-        x_min, y_min = pts.min(axis=0)
-        pts_px = ((pts - [x_min, y_min]) / res).astype(np.int32)
-        px_w = pts_px[:, 0].max() + 3
-        px_h = pts_px[:, 1].max() + 3
 
-        img = np.zeros((px_h, px_w), dtype=np.uint8)
-        img[pts_px[:, 1], pts_px[:, 0]] = 255
+def fit_bracketed_stem(xyz: np.ndarray):
+    """Estimate a local cylinder through the reference breast height."""
+    below = xyz[:, 2] < BREAST_HEIGHT_MIN
+    above = xyz[:, 2] > BREAST_HEIGHT_MAX
+    if min(np.count_nonzero(below), np.count_nonzero(above)) < MIN_STEM_SIDE_POINTS:
+        return None
 
-        edges = canny(img, sigma=canny_sigma)
+    origin = np.median(xyz[:, :2], axis=0)
+    xy = xyz[:, :2] - origin
+    height = xyz[:, 2] - BREAST_HEIGHT_M
+    slope = (np.median(xy[above], axis=0) - np.median(xy[below], axis=0))
+    slope /= np.median(height[above]) - np.median(height[below])
+    slope = np.clip(slope, -0.6, 0.6)
 
-        min_r = 10
-        max_r = 500
-        hough_radii = np.arange(min_r, max_r + 1, 1)
+    def radial_error(params):
+        slope = params[3:]
+        local = xy - params[:2] - height[:, None] * slope
+        distance_sq = (local * local).sum(axis=1) - (local @ slope)**2 / (1 + slope @ slope)
+        return np.sqrt(np.maximum(distance_sq, 0)) - params[2]
 
-        hough_res = hough_circle(edges, hough_radii)
-        accums, cx_list, cy_list, radii = hough_circle_peaks(
-            hough_res,
-            hough_radii,
-            total_num_peaks=1,  # 最多检测10个树干
-            normalize=True,
-        )
+    tolerance = STEM_BAND_INLIER_TOLERANCE_M
+    bounds = ([-np.inf, -np.inf, DBH_MIN_RADIUS_M, -0.65, -0.65],
+              [np.inf, np.inf, DBH_MAX_RADIUS_M, 0.65, 0.65])
+    candidates = []
+    for axis in (slope, np.zeros(2)):
+        flattened = xy - height[:, None] * axis
+        section = fit_stem_section(flattened)
+        if section:
+            cx, cy, radius = section["cx"], section["cy"], section["radius"]
+        else:
+            cx, cy, radius, _, _ = fit_circle_least_squares(flattened)
+        if radius is None:
+            continue
+        start = np.r_[cx, cy, np.clip(radius, DBH_MIN_RADIUS_M, DBH_MAX_RADIUS_M), axis]
+        fit = least_squares(radial_error, start, loss="cauchy", f_scale=0.02, bounds=bounds)
+        if not fit.success:
+            continue
 
-        for idx, (cx_px, cy_px, r_px, vote) in enumerate(
-            zip(cx_list, cy_list, radii, accums)
-        ):
-            if vote < hough_threshold:
-                continue  # 弱圆直接丢弃
+        errors = radial_error(fit.x)
+        support = np.abs(errors) <= tolerance
+        count = int(np.count_nonzero(support))
+        lower_support, upper_support = support & below, support & above
+        supported_sides = min(np.count_nonzero(lower_support), np.count_nonzero(upper_support))
+        side_residual = max(np.median(np.abs(errors[group])) for group in (below, above))
+        if count < 0.55 * len(xyz) or supported_sides < MIN_STEM_SIDE_POINTS or side_residual > tolerance:
+            continue
+        if height[upper_support].min() - height[lower_support].max() > MAX_STEM_EVIDENCE_GAP_M:
+            continue
+        unleaned = xy[support] - fit.x[:2] - height[support, None] * fit.x[3:]
+        angles = np.sort(np.arctan2(unleaned[:, 1], unleaned[:, 0]))
+        arc = 2 * np.pi - np.diff(np.r_[angles, angles[0] + 2 * np.pi]).max()
+        if arc < np.pi / 2:
+            continue
+        rmse = float(np.sqrt(np.mean(errors[support] ** 2)))
+        score = float(np.minimum(np.abs(errors), tolerance).mean())
+        candidates.append((score, {
+            "circle_id": 0, "n_points": count,
+            "cx": float(fit.x[0] + origin[0]), "cy": float(fit.x[1] + origin[1]),
+            "radius": float(fit.x[2]), "DBH": float(2 * fit.x[2]), "r2": np.nan, "vote": np.nan,
+            "inlier_fraction": count / len(xyz), "fit_rmse_m": rmse,
+            "arc_degrees": float(np.degrees(arc)), "fit_method": "bracketed_stem_cylinder",
+        }))
+    return min(candidates, key=lambda entry: entry[0])[1] if candidates else None
 
-            cx = cx_px * res + x_min
-            cy = cy_px * res + y_min
-            r = r_px * res
 
-            sel = (
-                np.abs(np.sqrt((pts[:, 0] - cx) ** 2 + (pts[:, 1] - cy) ** 2) - r)
-                < 0.03
-            )
-            pts_circle = pts[sel]
-
-            if pts_circle.shape[0] < 20:
-                continue
-
-            cx2, cy2, r2, score, n_used = fit_circle_least_squares(pts_circle)
-            if cx2 is None:
-                continue
-
-            DBH = 2 * r2  # 胸径 = 直径
-
-            results.append(
-                {
-                    "circle_id": idx,
-                    "treeid": id,
-                    "n_points": int(n_used),
-                    "cx": float(cx2),
-                    "cy": float(cy2),
-                    "radius": float(r2),
-                    "DBH": float(DBH),
-                    "r2": float(score),
-                    "vote": float(vote),
-                }
-            )
-
+def fit_missing_dbh_from_stem_band(xyz, tree_ids, measured_ids):
+    in_band = np.isfinite(xyz).all(axis=1) & (np.abs(xyz[:, 2] - BREAST_HEIGHT_M) <= STEM_BAND_HALF_HEIGHT_M)
+    selected = np.flatnonzero(in_band & ~np.isin(tree_ids, measured_ids))
+    selected = selected[np.argsort(tree_ids[selected], kind="stable")]
+    ids, starts = np.unique(tree_ids[selected], return_index=True)
+    results = []
+    for tree_id, start, stop in zip(ids, starts, np.r_[starts[1:], len(selected)]):
+        fit = fit_bracketed_stem(xyz[selected[start:stop]])
+        if fit is not None:
+            results.append({"treeid": tree_id, **fit})
     return pd.DataFrame(results)
 
 
@@ -280,32 +369,18 @@ mcp = FastMCP("ForestDBHExtractor")
     name="extract_forest_dbh",
     description=(
         "Compute the Diameter at Breast Height (DBH) for each tree in a forest point cloud. "
-        "If the user does not provide the file_path, ask them to clarify it "
-        "The function reads a classified point cloud where 'treeid' labels trees, "
-        "extracts a 1.3 m ± 0.1 m slice from the ground for each tree, fits a circle to that slice, "
-        "and saves DBH results as a CSV file."
+        "Provide an instance-labelled LAS/LAZ with an explicit height-above-ground field in metres. "
+        "Set z_is_normalized=true only when the input Z is confirmed to be height above ground in metres. "
+        "Fits a 1.2–1.4 m trunk section, with a local cylinder fallback if observations bracket 1.3 m. "
+        "The CSV identifies the method used for each measurement."
     ),
 )
-async def extract_forest_dbh(file_path: str, output_path: str = "./") -> dict:
+async def extract_forest_dbh(
+    file_path: str, output_path: str = "./", z_is_normalized: bool = False
+) -> dict:
     """
-    Read a classified forest point cloud and compute DBH for each tree using circle fitting.
-    Automatically performs tree segmentation if treeid is missing.
+    Compute DBH from instance-labelled points with height above ground in metres.
     """
-
-    # =============== 检查是否需要单木分割 ===============
-    if not has_treeid(file_path):
-        print("点云缺少 treeid，自动执行单木分割...")
-        try:
-            segment_output = os.path.join(output_path, "segmentation")
-            file_path = run_tree_segmentation(file_path, segment_output)
-            print(f"单木分割完成，使用分割结果: {file_path}")
-        except Exception as e:
-            return {
-                "status": "error",
-                "output_path": None,
-                "message": f"自动单木分割失败: {e}",
-                "data": None,
-            }
 
     # =============== 1️⃣ Read point cloud ===============
     try:
@@ -319,106 +394,75 @@ async def extract_forest_dbh(file_path: str, output_path: str = "./") -> dict:
             "data": None,
         }
 
-    # Ensure data is in DataFrame format
-    if isinstance(data, np.ndarray):
-        ncols = data.shape[1]
-        if ncols >= 4:
-            cols = ["x", "y", "z", "treeid"]
-        else:
-            raise ValueError("Point cloud array does not contain enough columns.")
-        df = pd.DataFrame(data, columns=cols)
-    else:
-        df = data
-
-    # Check required columns
-    if "treeid" not in df.columns or "z" not in df.columns:
+    if "treeid" not in data:
+        return {"status": "error", "output_path": None, "message": "请提供带单木编号的 LAS 或 LAZ。", "data": None}
+    height_field = next((field for field in HEIGHT_ABOVE_GROUND_FIELDS if field in data), None)
+    if height_field is None and z_is_normalized is not True:
         return {
-            "status": "error",
-            "output_path": None,
-            "message": "点云缺少 'z' 或 'treeid' 字段",
+            "status": "error", "output_path": None,
+            "message": (
+                "缺少离地高度字段。请提供 HeightAboveGround。"
+                "如果输入 Z 已按地面归一化，可在消息开头写「确认 Z 已按地面归一化」，"
+                "或直接调用工具时设置 z_is_normalized=true。"
+            ),
             "data": None,
         }
+    height_reference = height_field or "normalized_z"
+    points = data[data["treeid"] > 0]
+    if points.empty:
+        return {"status": "error", "output_path": None, "message": "点云没有可用于胸径测量的单木标签。", "data": None}
 
-    # Check treeid distribution and handle special cases
-    treeid_counts = df["treeid"].value_counts()
-    zero_count = treeid_counts.get(0, 0)
-    non_zero_count = sum(v for k, v in treeid_counts.items() if k != 0)
+    xyz = points[["x", "y", height_field or "z"]].to_numpy(dtype=np.float64)
+    tree_ids = points["treeid"].to_numpy()
+    valid_height = np.isfinite(xyz).all(axis=1)
+    in_slice = valid_height & (xyz[:, 2] >= BREAST_HEIGHT_MIN) & (xyz[:, 2] <= BREAST_HEIGHT_MAX)
+    per_tree = pd.DataFrame({
+        "treeid": tree_ids, "valid_height_points": valid_height, "breast_height_points": in_slice,
+    }).groupby("treeid", as_index=False).sum()
 
-    # If treeid=0 has most points (e.g., > 90%), treeid may not be proper segmentation
-    # In this case, treat treeid=0 as valid tree points
-    if zero_count > 0 and zero_count > non_zero_count * 9:
-        # treeid=0 dominates, treat it as tree points (not ground)
-        df = df[df["treeid"] == 0].copy()
-    else:
-        # Keep only valid tree points (treeid != 0)
-        df = df[df["treeid"] != 0]
-
-    # Check if there are any valid tree points
-    if len(df) == 0:
-        return {
-            "status": "error",
-            "output_path": None,
-            "message": f"点云中没有有效的树点数据，请确保已进行单木分割",
-            "data": None,
-        }
-
-    result_df = process_one_file_hough(
-        xyz=df[["x", "y", "z"]].values,
-        treeid=df["treeid"].values,
-        z_min=4.8,
-        z_max=5.8,
-        canny_sigma=2.0,
-        hough_threshold=0.2,
+    eligible = per_tree.loc[per_tree["breast_height_points"] >= MIN_DBH_POINTS, "treeid"]
+    fit_points = in_slice & np.isin(tree_ids, eligible.to_numpy())
+    results = pd.DataFrame(columns=["treeid", "DBH", "fit_method"])
+    if fit_points.any():
+        fitted = fit_dbh_sections(xyz=xyz[fit_points], treeid=tree_ids[fit_points])
+        if not fitted.empty:
+            results = fitted.assign(fit_method="breast_height_section_circle")
+    fallback = fit_missing_dbh_from_stem_band(xyz, tree_ids, results["treeid"].to_numpy())
+    if not fallback.empty:
+        results = pd.concat([results, fallback], ignore_index=True) if not results.empty else fallback
+    per_tree = per_tree.merge(results, how="left", on="treeid")
+    measured = pd.to_numeric(per_tree["DBH"], errors="coerce").where(lambda values: np.isfinite(values) & (values > 0))
+    per_tree["DBH"] = measured
+    per_tree["height_reference"] = height_reference
+    per_tree["measurement_status"] = np.select(
+        [measured.notna(), per_tree["valid_height_points"].eq(0), per_tree["breast_height_points"].eq(0),
+         per_tree["breast_height_points"].lt(MIN_DBH_POINTS)],
+        ["measured", "missing_height_above_ground", "no_breast_height_points", "insufficient_breast_height_points"],
+        default="fit_failed",
     )
+    os.makedirs(output_path, exist_ok=True)
+    output_csv = os.path.join(output_path, "forest_dbh_results.csv")
+    per_tree.to_csv(output_csv, index=False)
 
-    # Check if result is empty
-    if result_df.empty:
-        result_df.to_csv(
-            output_csv := os.path.join(output_path, "forest_dbh_results.csv"),
-            index=False,
-        )
+    diameters = measured.dropna()
+    missed = len(per_tree) - len(diameters)
+    summary = {
+        "tree_count": len(diameters), "detected_trees": len(diameters), "unmeasured_tree_count": missed,
+        "height_reference": height_reference,
+        "measurement_status_counts": per_tree["measurement_status"].value_counts().to_dict(),
+        "fit_method_counts": per_tree["fit_method"].value_counts().to_dict(),
+    }
+    if not len(diameters):
         return {
-            "status": "warning",
-            "output_path": output_csv,
-            "message": f"未在点云中检测到树木。点云可能未进行单木分类或在1.3m高度处点密度不足",
-            "data": {"detected_trees": 0},
+            "status": "warning", "output_path": output_csv,
+            "message": "胸高截面及邻近树干点无法支持胸径拟合。CSV 已逐树记录原因。", "data": summary,
         }
-
-    # Check if 'vote' column exists
-    if "vote" not in result_df.columns:
-        result_df.to_csv(
-            output_csv := os.path.join(output_path, "forest_dbh_results.csv"),
-            index=False,
-        )
-        return {
-            "status": "warning",
-            "output_path": output_csv,
-            "message": f"未检测到有效的树干圆，可能需要调整检测参数",
-            "data": {"detected_trees": 0},
-        }
-
-    result_df.to_csv(
-        output_csv := os.path.join(output_path, "forest_dbh_results.csv"), index=False
-    )
-
-    # Compute tree height statistics
-    # index = result_df["vote"] >= 0.5
-    DBH = result_df["DBH"].dropna()
-    mean_height = float(DBH.mean()) if not DBH.empty else 0.0
-    var_height = float(DBH.var()) if not DBH.empty else 0.0
-    max_height = float(DBH.max()) if not DBH.empty else 0.0
-    min_height = float(DBH.min()) if not DBH.empty else 0.0
-
+    summary.update(dbh_mean=round(float(diameters.mean()), 2), dbh_max=round(float(diameters.max()), 2),
+                   dbh_min=round(float(diameters.min()), 2))
     return {
-        "status": "success",
-        "output_path": output_csv,
-        "message": f"成功提取 {len(DBH)} 棵树的胸径。平均胸径: {mean_height:.2f}米，最大: {max_height:.2f}米，最小: {min_height:.2f}米",
-        "data": {
-            "tree_count": len(DBH),
-            "dbh_mean": round(mean_height, 2),
-            "dbh_max": round(max_height, 2),
-            "dbh_min": round(min_height, 2),
-        },
+        "status": "success", "output_path": output_csv,
+        "message": f"已测量 {len(diameters)} 棵树的胸径，平均 {diameters.mean():.2f} 米。{missed} 棵未测得，原因见 CSV。",
+        "data": summary,
     }
 
 

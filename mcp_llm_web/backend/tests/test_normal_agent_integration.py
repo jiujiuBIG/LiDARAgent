@@ -22,16 +22,21 @@ class RecordingSession:
             "message": "ok",
             "data": {
                 key: arguments[key]
-                for key in ("radius", "max_nn", "orientation", "label_schema")
+                for key in ("radius", "max_nn", "orientation", "label_schema", "tile_size")
                 if key in arguments
             },
         }
         return SimpleNamespace(content=[SimpleNamespace(text=json.dumps(result))])
 
 
-@pytest.mark.parametrize("message,requested,expected_orientation", [
+@pytest.mark.parametrize("message,requested,expected_parameters", [
     ("半径 0.35，最多 20 个邻居，计算法向量。", {}, {"orientation": "none"}),
     ("半径 0.35，最多 20 个邻居，朝上。", {"orientation": "up"}, {"orientation": "up"}),
+    (
+        "半径 0.35，最多 20 个邻居，分块宽度 16 米。",
+        {"tile_size": 16},
+        {"orientation": "none", "tile_size": 16.0},
+    ),
     (
         "半径 0.35，最多 20 个邻居，用 FORinstance 标签让树干朝外。",
         {"orientation": "stem_outward", "label_schema": "forinstance"},
@@ -39,7 +44,7 @@ class RecordingSession:
     ),
 ])
 def test_chat_passes_normal_parameters_and_controls_paths(
-    tmp_path, monkeypatch, message, requested, expected_orientation
+    tmp_path, monkeypatch, message, requested, expected_parameters
 ):
     source = tmp_path / "a.las"
     source.touch()
@@ -70,7 +75,7 @@ def test_chat_passes_normal_parameters_and_controls_paths(
     assert tool_name == NORMALS_TOOL
     assert actual["file_path"] == str(source)
     assert Path(actual["output_path"]).parent == results
-    expected = {"radius": 0.35, "max_nn": 20, **expected_orientation}
+    expected = {"radius": 0.35, "max_nn": 20, **expected_parameters}
     assert result["tool_data"] == expected
     assert result["tool_results"][0]["arguments"] == expected
     assert Path(result["output_path"]).parent == Path(actual["output_path"])
@@ -122,6 +127,8 @@ def test_chat_suggests_normal_parameters_before_an_explicit_followup(tmp_path, m
     {"radius": 1, "orientation": "side"},
     {"radius": 1, "orientation": "stem_outward"},
     {"radius": 1, "orientation": "stem_outward", "label_schema": "unknown"},
+    {"radius": 1, "tile_size": 0}, {"radius": 1, "tile_size": True},
+    {"radius": 1, "tile_size": float("inf")},
 ])
 def test_normal_tool_rejects_invalid_parameters_without_call(tmp_path, arguments):
     service = MCPService()

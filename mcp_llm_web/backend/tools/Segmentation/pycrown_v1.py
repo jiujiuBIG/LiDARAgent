@@ -16,12 +16,20 @@ import laspy
 from numba import jit
 import numpy as np
 import rasterio
+from pyproj import CRS as PyprojCRS
 from rasterio.crs import CRS
 from rasterio.transform import from_origin
 from scipy import ndimage
 from scipy.spatial import ConvexHull, QhullError, cKDTree
 from shapely.geometry import Point, Polygon
 from skimage.filters import threshold_otsu
+
+if __package__:
+    from .point_instances import label_crown_and_stem_instances, label_traced_instances, las_height_above_ground, write_instance_cloud
+    from .spatial_inputs import require_metric_crs, validate_chm, validate_point_cloud_alignment
+else:
+    from point_instances import label_crown_and_stem_instances, label_traced_instances, las_height_above_ground, write_instance_cloud
+    from spatial_inputs import require_metric_crs, validate_chm, validate_point_cloud_alignment
 
 try:
     from tools.Segmentation.pycrown_pilot import DalponteSettings, crown_features, dalponte_labels
@@ -102,6 +110,7 @@ class Grid:
     crs: CRS
     las_path: Path | None = None
     _cache: dict = field(default_factory=dict, repr=False, compare=False)
+    ground_reference: str | None = None
 
     @property
     def pixel_size(self):
@@ -134,29 +143,34 @@ def _discover_las_path(chm_path: Path, las_path: Path | None = None) -> Path | N
 
 
 def read_grids(chm_path, dsm_path, dtm_path, las_path=None):
+    if dtm_path is None:
+        raise ValueError('An aligned DTM is required when reading terrain grids')
     arrays = []
     reference = None
-    for path in (chm_path, dsm_path, dtm_path):
+    for path in (chm_path, dtm_path, dsm_path):
+        if path is None:
+            continue
         with rasterio.open(path) as source:
             signature = (source.shape, source.transform, source.crs)
             if source.count != 1:
                 raise ValueError(f'Expected a single-band raster: {path}')
             if reference is None:
+                crs = validate_chm(source, square_pixels=True)
+                bounds = source.bounds
                 reference = signature
             if signature != reference:
                 raise ValueError(f'CHM, DSM and DTM must be aligned on the same grid and CRS: {path}')
             values = source.read(1, masked=True).astype(np.float32)
             physical = values.filled(np.nan) * source.scales[0] + source.offsets[0]
             arrays.append(np.where(np.isfinite(physical), physical, np.nan))
-    _, transform, crs = reference
-    if crs is None or not crs.is_projected or not np.isclose(crs.linear_units_factor[1], 1):
-        raise ValueError('The input grid must use a projected CRS in metres')
-    if (transform.b != 0 or transform.d != 0 or transform.a <= 0
-            or not np.isclose(transform.a, -transform.e)):
-        raise ValueError('The input grid must be north-up with square pixels')
-    chm, dsm, dtm = arrays
+    _, transform, _ = reference
+    chm, dtm = arrays[:2]
+    dsm = arrays[2] if dsm_path is not None else dtm + chm
     resolved_las = _discover_las_path(Path(chm_path), las_path)
-    return Grid(chm, np.isfinite(chm), dsm, dtm, transform, crs, las_path=resolved_las)
+    if resolved_las is not None:
+        validate_point_cloud_alignment(resolved_las, crs, bounds)
+    return Grid(chm, np.isfinite(chm), dsm, dtm, transform, crs,
+                las_path=resolved_las, ground_reference='dtm')
 
 
 def _grid_reduce(x, y, z, minx, maxy, res, shape, how='max'):
@@ -186,7 +200,7 @@ def _fill_nearest(arr):
     return arr[tuple(idx)]
 
 
-def build_grid_from_las(las_path: Path, resolution_m: float = 0.5, default_crs: str | None = 'EPSG:25832') -> Grid:
+def build_grid_from_las(las_path: Path, resolution_m: float = 0.5, default_crs: str | None = None) -> Grid:
     """Build an aligned CHM, DSM and DTM Grid directly from a LAS/LAZ point cloud."""
     resolved = Path(las_path)
     if not resolved.is_file():
@@ -194,6 +208,8 @@ def build_grid_from_las(las_path: Path, resolution_m: float = 0.5, default_crs: 
     if not np.isfinite(resolution_m) or resolution_m <= 0:
         raise ValueError('Resolution must be positive and finite')
     las = laspy.read(resolved)
+    parsed_crs = las.header.parse_crs()
+    crs = require_metric_crs(parsed_crs if parsed_crs is not None else default_crs, f"点云 {resolved.name}")
     x = np.asarray(las.x, dtype=np.float64)
     y = np.asarray(las.y, dtype=np.float64)
     z = np.asarray(las.z, dtype=np.float64)
@@ -202,6 +218,7 @@ def build_grid_from_las(las_path: Path, resolution_m: float = 0.5, default_crs: 
     dims = set(las.point_format.dimension_names)
     cls = np.asarray(las.classification, dtype=np.int32) if 'classification' in dims else np.zeros(len(x), dtype=np.int32)
     ret_num = np.asarray(las.return_number, dtype=np.int32) if 'return_number' in dims else np.ones(len(x), dtype=np.int32)
+    explicit_height = las_height_above_ground(las)
 
     minx, maxx = float(x.min()), float(x.max())
     miny, maxy = float(y.min()), float(y.max())
@@ -210,21 +227,22 @@ def build_grid_from_las(las_path: Path, resolution_m: float = 0.5, default_crs: 
         int(np.ceil((maxx - minx) / resolution_m)) + 1,
     )
     transform = from_origin(minx, maxy, resolution_m, resolution_m)
-    parsed_crs = las.header.parse_crs()
-    crs = CRS.from_user_input(parsed_crs) if parsed_crs is not None else (CRS.from_user_input(default_crs) if default_crs else None)
-    if crs is None or not crs.is_projected or not np.isclose(crs.linear_units_factor[1], 1):
-        raise ValueError('The input point cloud must use a projected CRS in metres')
+    del las
 
     dsm_raw = _grid_reduce(x, y, z, minx, maxy, resolution_m, shape, 'max')
     ground_mask = cls == 2
+    del cls
+    ground_reference = None
     if np.any(ground_mask):
         dtm_raw = _grid_reduce(x[ground_mask], y[ground_mask], z[ground_mask], minx, maxy, resolution_m, shape, 'min')
         dtm = ndimage.median_filter(_fill_nearest(dtm_raw), size=3, mode='nearest')
+        ground_reference = 'classified_ground'
     elif float(np.percentile(z, 5)) >= -0.5 and float(np.percentile(z, 1)) <= 0.5:
         dtm = np.zeros_like(dsm_raw)
     else:
         dtm_raw = _grid_reduce(x, y, z, minx, maxy, resolution_m, shape, 'min')
         dtm = ndimage.median_filter(_fill_nearest(dtm_raw), size=3, mode='nearest')
+    del ground_mask
 
     occ = np.isfinite(dsm_raw)
     dist = ndimage.distance_transform_edt(~occ, sampling=resolution_m)
@@ -240,9 +258,19 @@ def build_grid_from_las(las_path: Path, resolution_m: float = 0.5, default_crs: 
     in_bounds = (rows >= 0) & (rows < nrows) & (cols >= 0) & (cols < ncols)
     r_c = np.clip(rows, 0, nrows - 1)
     c_c = np.clip(cols, 0, ncols - 1)
-    norm_z = z - dtm[r_c, c_c]
-    cache = {'las_arrays': (x, y, z, ret_num, rows, cols, in_bounds, norm_z)}
-    return Grid(chm, occ, dsm, dtm, transform, crs, las_path=resolved, _cache=cache)
+    if ground_reference is not None:
+        norm_z = z - dtm[r_c, c_c]
+    elif explicit_height is not None:
+        norm_z = explicit_height
+        ground_reference = 'las_height_above_ground'
+    else:
+        # Terrain inferred from unclassified Z may support a 2-D CHM, but does not
+        # establish a ground reference for the three-dimensional stem search.
+        norm_z = np.full_like(z, np.nan)
+    cache = {'las_arrays': (x, y, z, ret_num, rows, cols, in_bounds, norm_z),
+             'pointcloud_height_reference': ground_reference}
+    return Grid(chm, occ, dsm, dtm, transform, crs, las_path=resolved,
+                _cache=cache, ground_reference=ground_reference)
 
 
 def smooth_chm(grid, settings):
@@ -326,17 +354,48 @@ def detect_gaussian_treetops(
 
     chosen = []
     ncols = heights.shape[1]
-    for cell, h_val in candidates:
-        row, col = divmod(cell, ncols)
-        req_dist = float(min_distance_m)
-        if height_spacing_slope > 0.0 and h_val > 16.0:
-            req_dist += float(height_spacing_slope) * (h_val - 16.0)
-        req_dist_sq = req_dist ** 2
-        if all(
-            ((row - orow) * pixel_size_m) ** 2 + ((col - ocol) * pixel_size_m) ** 2 >= req_dist_sq
-            for orow, ocol in chosen
-        ):
-            chosen.append((row, col))
+    if height_spacing_slope <= 0.0:
+        min_d = float(min_distance_m)
+        min_d_sq = min_d * min_d
+        inv_d = 1.0 / min_d
+        buckets: dict[tuple[int, int], list[tuple[float, float]]] = {}
+        for cell, _ in candidates:
+            row, col = divmod(cell, ncols)
+            ym = row * pixel_size_m
+            xm = col * pixel_size_m
+            by = int(math.floor(ym * inv_d))
+            bx = int(math.floor(xm * inv_d))
+            too_close = False
+            for dby in (-1, 0, 1):
+                for dbx in (-1, 0, 1):
+                    pts = buckets.get((by + dby, bx + dbx))
+                    if pts is None:
+                        continue
+                    for oy, ox in pts:
+                        dy = ym - oy
+                        dx = xm - ox
+                        if dy * dy + dx * dx < min_d_sq:
+                            too_close = True
+                            break
+                    if too_close:
+                        break
+                if too_close:
+                    break
+            if not too_close:
+                chosen.append((row, col))
+                buckets.setdefault((by, bx), []).append((ym, xm))
+    else:
+        for cell, h_val in candidates:
+            row, col = divmod(cell, ncols)
+            req_dist = float(min_distance_m)
+            if h_val > 16.0:
+                req_dist += float(height_spacing_slope) * (h_val - 16.0)
+            req_dist_sq = req_dist ** 2
+            if all(
+                ((row - orow) * pixel_size_m) ** 2 + ((col - ocol) * pixel_size_m) ** 2 >= req_dist_sq
+                for orow, ocol in chosen
+            ):
+                chosen.append((row, col))
     chosen.sort()
     return np.array([(r + 0.5, c + 0.5) for r, c in chosen], dtype=np.float64).reshape(-1, 2)
 
@@ -357,27 +416,39 @@ def suppress_shoulder_peaks(
     order = np.argsort(-heights)
     kept = []
     nrows, ncols = surface.shape
+    inv_d = 1.0 / float(max_dist_m)
+    tall_buckets: dict[tuple[int, int], list[int]] = {}
     for idx in order:
         r, c = peaks[idx]
         h = heights[idx]
+        by = int(math.floor(r * pixel_size_m * inv_d))
+        bx = int(math.floor(c * pixel_size_m * inv_d))
         is_shoulder = False
-        for k in kept:
-            rk, ck = peaks[k]
-            hk = heights[k]
-            if hk < min_tall_h_m or (hk - h) < min_h_diff_m:
-                continue
-            d = math.hypot((r - rk) * pixel_size_m, (c - ck) * pixel_size_m)
-            if d > max_dist_m:
-                continue
-            n_steps = max(5, int(math.ceil(d / (0.25 * pixel_size_m))))
-            rs = np.clip(np.floor(np.linspace(r, rk, n_steps)).astype(int), 0, nrows - 1)
-            cs = np.clip(np.floor(np.linspace(c, ck, n_steps)).astype(int), 0, ncols - 1)
-            drop = h - float(np.min(surface[rs, cs]))
-            if drop < min_drop_m:
-                is_shoulder = True
+        for dby in (-1, 0, 1):
+            for dbx in (-1, 0, 1):
+                for k in tall_buckets.get((by + dby, bx + dbx), ()):
+                    rk, ck = peaks[k]
+                    hk = heights[k]
+                    if (hk - h) < min_h_diff_m:
+                        continue
+                    d = math.hypot((r - rk) * pixel_size_m, (c - ck) * pixel_size_m)
+                    if d > max_dist_m:
+                        continue
+                    n_steps = max(5, int(math.ceil(d / (0.25 * pixel_size_m))))
+                    rs = np.clip(np.floor(np.linspace(r, rk, n_steps)).astype(int), 0, nrows - 1)
+                    cs = np.clip(np.floor(np.linspace(c, ck, n_steps)).astype(int), 0, ncols - 1)
+                    drop = h - float(np.min(surface[rs, cs]))
+                    if drop < min_drop_m:
+                        is_shoulder = True
+                        break
+                if is_shoulder:
+                    break
+            if is_shoulder:
                 break
         if not is_shoulder:
             kept.append(idx)
+            if h >= min_tall_h_m:
+                tall_buckets.setdefault((by, bx), []).append(idx)
     kept.sort()
     return peaks[kept]
 
@@ -513,7 +584,7 @@ def _verified_stem_roots(counts: np.ndarray, origin: np.ndarray, stems, min_stem
     return roots
 
 
-@jit(nopython=True, nogil=True)
+@jit(nopython=True, nogil=True, cache=True)
 def _trace_owners_jit(
     counts,
     origin_x,
@@ -639,33 +710,68 @@ def _supported_crown_tops(
     kernel = np.ones((3, 3), dtype=np.int32)
     result = {}
     start_level = int(SEED_TOP_M / VERTICAL_3D_M)
-    nz = counts.shape[2]
-    for stem_id in range(len(stems)) if stem_ids is None else stem_ids:
-        belongs = owners == stem_id
-        levels = np.flatnonzero(np.any(belongs, axis=(0, 1)))
-        levels = levels[levels >= start_level]
-        if not len(levels):
+    ny, nx, nz = counts.shape
+    target_ids = list(range(len(stems)) if stem_ids is None else stem_ids)
+    if not target_ids or start_level >= nz or not len(stems):
+        return result
+
+    lut = np.zeros(len(stems), dtype=bool)
+    lut[target_ids] = True
+    sub_owners = owners[..., start_level:]
+    occ_mask = sub_owners >= 0
+    r_all, c_all, _ = np.nonzero(occ_mask)
+    if not len(r_all):
+        return result
+    s_all = sub_owners[occ_mask]
+    keep_s = lut[s_all]
+    if not np.any(keep_s):
+        return result
+    r_all, c_all, s_all = r_all[keep_s], c_all[keep_s], s_all[keep_s]
+    order_s = np.argsort(s_all, kind='mergesort')
+    s_sorted = s_all[order_s]
+    r_sorted = r_all[order_s]
+    c_sorted = c_all[order_s]
+    uniq_s, split_pos = np.unique(s_sorted, return_index=True)
+    ends = np.append(split_pos[1:], len(s_sorted))
+    stem_bboxes = {}
+    for sid, st, en in zip(uniq_s.tolist(), split_pos.tolist(), ends.tolist()):
+        r0 = max(0, int(r_sorted[st:en].min()) - 1)
+        r1 = min(ny, int(r_sorted[st:en].max()) + 2)
+        c0 = max(0, int(c_sorted[st:en].min()) - 1)
+        c1 = min(nx, int(c_sorted[st:en].max()) + 2)
+        stem_bboxes[sid] = (r0, r1, c0, c1)
+
+    for stem_id in target_ids:
+        bbox = stem_bboxes.get(stem_id)
+        if bbox is None:
             continue
+        r0, r1, c0, c1 = bbox
+        local_owners = owners[r0:r1, c0:c1, start_level:]
+        local_counts = counts[r0:r1, c0:c1, start_level:]
+        belongs = local_owners == stem_id
         stem_x, stem_y = stems[stem_id]
 
         level_caps, level_core_caps, level_pts = {}, {}, {}
+        cap_cache = {}
         for lv in range(start_level, nz):
-            mask = belongs[..., lv]
+            rel = lv - start_level
+            mask = belongs[..., rel]
             if not mask.any():
                 level_caps[lv] = level_core_caps[lv] = level_pts[lv] = 0
                 continue
             cap = ndimage.convolve(mask.astype(np.int32), kernel, mode='constant')
+            cap_cache[lv] = cap
             rows, cols = np.nonzero(mask & (cap >= min_cap_cells))
             if max_stem_offset_m is not None and len(rows):
-                x_e = origin[0] + (cols + 0.5) * HORIZONTAL_3D_M
-                y_e = origin[1] + (rows + 0.5) * HORIZONTAL_3D_M
+                x_e = origin[0] + (cols + c0 + 0.5) * HORIZONTAL_3D_M
+                y_e = origin[1] + (rows + r0 + 0.5) * HORIZONTAL_3D_M
                 keep = ((x_e - stem_x) ** 2 + (y_e - stem_y) ** 2) <= max_stem_offset_m ** 2
                 rows, cols = rows[keep], cols[keep]
             level_caps[lv] = int(cap[rows, cols].max()) if len(rows) else int(cap[mask].max())
-            level_pts[lv] = int(counts[..., lv][mask].sum())
+            level_pts[lv] = int(local_counts[..., rel][mask].sum())
             all_r, all_c = np.nonzero(mask)
-            x = origin[0] + (all_c + 0.5) * HORIZONTAL_3D_M
-            y = origin[1] + (all_r + 0.5) * HORIZONTAL_3D_M
+            x = origin[0] + (all_c + c0 + 0.5) * HORIZONTAL_3D_M
+            y = origin[1] + (all_r + r0 + 0.5) * HORIZONTAL_3D_M
             core_r = 0.55 if max_stem_offset_m is None else min(0.55, max_stem_offset_m)
             core = ((x - stem_x) ** 2 + (y - stem_y) ** 2) <= (core_r ** 2)
             level_core_caps[lv] = int(cap[all_r[core], all_c[core]].max()) if core.any() else 0
@@ -704,12 +810,12 @@ def _supported_crown_tops(
         if max_stem_offset_m is not None:
             eligible_strong = []
             for slv in strong_lvs:
-                m_s = belongs[..., slv]
-                c_s = ndimage.convolve(m_s.astype(np.int32), kernel, mode='constant')
+                m_s = belongs[..., slv - start_level]
+                c_s = cap_cache[slv]
                 r_s, col_s = np.nonzero(m_s & (c_s >= min_cap_cells))
                 if len(r_s):
-                    xs = origin[0] + (col_s + 0.5) * HORIZONTAL_3D_M
-                    ys = origin[1] + (r_s + 0.5) * HORIZONTAL_3D_M
+                    xs = origin[0] + (col_s + c0 + 0.5) * HORIZONTAL_3D_M
+                    ys = origin[1] + (r_s + r0 + 0.5) * HORIZONTAL_3D_M
                     if np.any((xs - stem_x) ** 2 + (ys - stem_y) ** 2 <= max_stem_offset_m ** 2):
                         eligible_strong.append(slv)
             if not eligible_strong:
@@ -723,11 +829,12 @@ def _supported_crown_tops(
             if mid_lvs:
                 base_dx, base_dy = [], []
                 for mlv in mid_lvs:
-                    m_m = belongs[..., mlv]
+                    rel_m = mlv - start_level
+                    m_m = belongs[..., rel_m]
                     r_m, c_m = np.nonzero(m_m)
-                    w_m = np.maximum(counts[r_m, c_m, mlv].astype(float), 1.0)
-                    base_dx.append(float(np.sum((origin[0] + (c_m + 0.5) * HORIZONTAL_3D_M - stem_x) * w_m) / np.sum(w_m)))
-                    base_dy.append(float(np.sum((origin[1] + (r_m + 0.5) * HORIZONTAL_3D_M - stem_y) * w_m) / np.sum(w_m)))
+                    w_m = np.maximum(local_counts[r_m, c_m, rel_m].astype(float), 1.0)
+                    base_dx.append(float(np.sum((origin[0] + (c_m + c0 + 0.5) * HORIZONTAL_3D_M - stem_x) * w_m) / np.sum(w_m)))
+                    base_dy.append(float(np.sum((origin[1] + (r_m + r0 + 0.5) * HORIZONTAL_3D_M - stem_y) * w_m) / np.sum(w_m)))
                 ref_dx, ref_dy = float(np.median(base_dx)), float(np.median(base_dy))
             else:
                 ref_dx = ref_dy = 0.0
@@ -740,11 +847,12 @@ def _supported_crown_tops(
                     running_max_pts = pts_here
                     peak_lv = slv
                 elif running_max_pts >= 1500 and (slv + 0.5) * VERTICAL_3D_M >= 19.5 and slv > peak_lv and idx_s > 0:
-                    m_s = belongs[..., slv]
+                    rel_s = slv - start_level
+                    m_s = belongs[..., rel_s]
                     r_s, c_s = np.nonzero(m_s)
-                    w_s = np.maximum(counts[r_s, c_s, slv].astype(float), 1.0)
-                    dx_s = float(np.sum((origin[0] + (c_s + 0.5) * HORIZONTAL_3D_M - stem_x) * w_s) / np.sum(w_s))
-                    dy_s = float(np.sum((origin[1] + (r_s + 0.5) * HORIZONTAL_3D_M - stem_y) * w_s) / np.sum(w_s))
+                    w_s = np.maximum(local_counts[r_s, c_s, rel_s].astype(float), 1.0)
+                    dx_s = float(np.sum((origin[0] + (c_s + c0 + 0.5) * HORIZONTAL_3D_M - stem_x) * w_s) / np.sum(w_s))
+                    dy_s = float(np.sum((origin[1] + (r_s + r0 + 0.5) * HORIZONTAL_3D_M - stem_y) * w_s) / np.sum(w_s))
                     drift_reversed = (dx_s * ref_dx + dy_s * ref_dy) < -0.005
                     if pts_here <= running_max_pts * peak_drop_stop and drift_reversed:
                         lv = strong_lvs[idx_s - 1]
@@ -754,13 +862,14 @@ def _supported_crown_tops(
         top_slice = [l for l in strong_lvs if abs(l - lv) <= 2 and l <= lv]
         all_x, all_y, all_w = [], [], []
         for l_idx in top_slice:
-            m_l = belongs[..., l_idx]
-            c_l = ndimage.convolve(m_l.astype(np.int32), kernel, mode='constant')
+            rel_l = l_idx - start_level
+            m_l = belongs[..., rel_l]
+            c_l = cap_cache[l_idx]
             r_l, col_l = np.nonzero(m_l & (c_l >= min_cap_cells))
             if not len(r_l):
                 continue
-            x_l = origin[0] + (col_l + 0.5) * HORIZONTAL_3D_M
-            y_l = origin[1] + (r_l + 0.5) * HORIZONTAL_3D_M
+            x_l = origin[0] + (col_l + c0 + 0.5) * HORIZONTAL_3D_M
+            y_l = origin[1] + (r_l + r0 + 0.5) * HORIZONTAL_3D_M
             if max_stem_offset_m is not None:
                 keep = ((x_l - stem_x) ** 2 + (y_l - stem_y) ** 2) <= max_stem_offset_m ** 2
                 r_l, col_l, x_l, y_l = r_l[keep], col_l[keep], x_l[keep], y_l[keep]
@@ -768,7 +877,7 @@ def _supported_crown_tops(
                 continue
             all_x.append(x_l)
             all_y.append(y_l)
-            all_w.append(np.maximum(counts[r_l, col_l, l_idx].astype(float), 1.0))
+            all_w.append(np.maximum(local_counts[r_l, col_l, rel_l].astype(float), 1.0))
 
         if not all_w:
             continue
@@ -816,10 +925,17 @@ def _load_point_cloud_arrays(grid: Grid):
     in_bounds = (rows >= 0) & (rows < nrows) & (cols >= 0) & (cols < ncols)
     r_c = np.clip(rows, 0, nrows - 1)
     c_c = np.clip(cols, 0, ncols - 1)
-    ground = grid.dtm[r_c, c_c]
-    if not np.isfinite(ground).any():
-        ground = np.zeros_like(z)
-    norm_z = z - ground
+    reference = grid.ground_reference
+    if reference == 'dtm':
+        norm_z = z - grid.dtm[r_c, c_c]
+    else:
+        norm_z = las_height_above_ground(las)
+        if norm_z is None:
+            norm_z = np.full_like(z, np.nan)
+        else:
+            reference = 'las_height_above_ground'
+    norm_z = np.where(in_bounds, norm_z, np.nan)
+    grid._cache['pointcloud_height_reference'] = reference
     arrays = (x, y, z, ret_num, rows, cols, in_bounds, norm_z)
     grid._cache['las_arrays'] = arrays
     return arrays
@@ -834,6 +950,7 @@ def _precompute_3d_stem_evidence(grid: Grid):
         return None
     x, y, _, _, _, _, in_bounds, norm_z = arrays
     valid_pts = in_bounds & np.isfinite(norm_z) & np.isfinite(x) & np.isfinite(y)
+    grid._cache['pointcloud_supplement_valid_points'] = int(np.count_nonzero(valid_pts))
     if not np.any(valid_pts):
         grid._cache['stem_evidence'] = None
         return None
@@ -844,7 +961,7 @@ def _precompute_3d_stem_evidence(grid: Grid):
     low_grid, low_origin = _voxel_counts(cloud[cloud[:, 2] < SEED_TOP_M], HORIZONTAL_3D_M, VERTICAL_3D_M, SEED_BOTTOM_M)
     run, density = _stem_support_scores(low_grid, VERTICAL_3D_M)
     stems = _stem_positions(run, density, low_origin, HORIZONTAL_3D_M, min_layers=7)
-    if not stems or not lower_candidates:
+    if not stems:
         grid._cache['stem_evidence'] = None
         return None
     evidence = {
@@ -899,6 +1016,10 @@ def _filter_inside_margins(peaks: np.ndarray, shape: tuple[int, int], pixel_size
 
 
 def find_candidates(grid, surface, settings):
+    grid._cache.pop('supplement_heights', None)
+    if not settings.use_pointcloud_supplement:
+        grid._cache.pop('stem_evidence', None)
+        grid._cache.pop('pointcloud_supplement_valid_points', None)
     if settings.smoothing_filter == 'gaussian':
         peaks = detect_gaussian_treetops(
             grid.chm, surface, grid.valid, grid.pixel_size,
@@ -953,7 +1074,8 @@ def find_candidates(grid, surface, settings):
                     occupied = set(zip(rows.tolist(), cols.tolist()))
                     nrows, ncols = surface.shape
                     extra = []
-                    for x, y, _ in added_pts:
+                    supplement_heights = grid._cache.setdefault('supplement_heights', {})
+                    for x, y, height in added_pts:
                         col_f, row_f = ~grid.transform * (x, y)
                         r, c = int(np.floor(row_f)), int(np.floor(col_f))
                         if (
@@ -964,6 +1086,7 @@ def find_candidates(grid, surface, settings):
                         ):
                             extra.append((float(row_f), float(col_f)))
                             occupied.add((r, c))
+                            supplement_heights[(r, c)] = float(height)
                     if extra:
                         extra_arr = _filter_inside_margins(
                             np.array(extra, dtype=np.float64).reshape(-1, 2),
@@ -1156,7 +1279,8 @@ def smooth_crowns_and_classify_las(grid: Grid, result: Segmentation, raster_crow
     if out_las_path is not None and kept_point_indices:
         all_idx = np.concatenate(kept_point_indices)
         all_tree_ids = np.concatenate(kept_point_tree_ids)
-        header = laspy.LasHeader(point_format=0, version='1.2')
+        header = laspy.LasHeader(point_format=0, version='1.4')
+        header.add_crs(PyprojCRS.from_wkt(grid.crs.to_wkt()), keep_compatibility=False)
         header.offsets = np.floor([np.min(x[all_idx]), np.min(y[all_idx]), np.min(z[all_idx])])
         header.scales = [0.001, 0.001, 0.001]
         header.add_extra_dim(laspy.ExtraBytesParams(name='tree_id', type=np.int32))
@@ -1197,7 +1321,8 @@ def result_vectors(grid, result):
     return records, tops, crowns
 
 
-def write_results(folder, grid, result, export_las=True):
+def write_results(folder, grid, result, export_las=True, *, settings=Settings()):
+    grid._cache.pop('instance_export', None)
     records, tops, crowns = result_vectors(grid, result)
     with rasterio.open(
         folder / 'crown_labels.tif', 'w', driver='GTiff', count=1, dtype='int32',
@@ -1217,6 +1342,40 @@ def write_results(folder, grid, result, export_las=True):
         las_out = (folder / 'trees.las') if export_las else None
         smooth_crowns, classified_points = smooth_crowns_and_classify_las(grid, result, crowns, out_las_path=las_out)
         smooth_crowns.to_file(folder / 'crowns_smooth.gpkg', index=False, driver='GPKG', engine='pyogrio')
+        if export_las:
+            arrays = _load_point_cloud_arrays(grid)
+            if arrays is None:
+                raise ValueError('Source point cloud is empty or unavailable for export.')
+            x, y, _, _, _, _, in_bounds, norm_z = arrays
+            heights = np.where(in_bounds, norm_z, np.nan)
+            cloud = np.column_stack((x, y, heights))
+            evidence = grid._cache.get('stem_evidence')
+            raster_ids = set(crowns['tree_id'])
+            supplements = grid._cache.get('supplement_heights', {})
+            treetops = {
+                record['tree_id']: (
+                    record['x_initial'], record['y_initial'],
+                    supplements.get(tuple(seed.astype(int)), float(grid.chm[tuple(seed.astype(int))])),
+                )
+                for record, seed in zip(records, result.initial)
+                if settings.use_pointcloud_supplement and record['tree_id'] in raster_ids
+            }
+            traced = None
+            if evidence and treetops:
+                traced_tops = _resolve_traced_tops(evidence, list(range(len(evidence['stems']))))
+                traced = label_traced_instances(
+                    cloud, evidence['owners'], evidence['vorigin'], HORIZONTAL_3D_M, VERTICAL_3D_M,
+                    traced_tops, treetops, SEED_BOTTOM_M,
+                )
+            point_ids = label_crown_and_stem_instances(
+                cloud, result.labels, grid.transform, treetops, settings.min_canopy_m,
+                stem_positions=(evidence or {}).get('stems', ()), traced_labels=traced,
+                stem_top_m=SEED_TOP_M,
+            )
+            grid._cache['instance_export'] = write_instance_cloud(
+                grid.las_path, folder / 'tree_instances.las', heights, point_ids,
+                method="crown_raster_and_verified_stems",
+            )
     return classified_points
 
 
@@ -1225,25 +1384,31 @@ def run(chm, dsm, dtm, output, settings, las=None, export_las=True, resolution_m
     if output.exists():
         raise FileExistsError(f'Output path already exists: {output}')
     with rasterio.Env(GDAL_PAM_ENABLED='NO'):
-        if chm is not None and dsm is not None and dtm is not None:
+        if chm is not None and dtm is not None:
             grid = read_grids(chm, dsm, dtm, las_path=las)
         elif las is not None and chm is None and dsm is None and dtm is None:
             grid = build_grid_from_las(las, resolution_m=resolution_m)
         else:
-            raise ValueError('Provide aligned --chm/--dsm/--dtm rasters or a single --las point cloud')
+            raise ValueError('Provide aligned --chm and --dtm with optional --dsm, or a single --las point cloud')
         loaded = perf_counter()
         result = segment(grid, settings)
         segmented = perf_counter()
         output.parent.mkdir(parents=True, exist_ok=True)
         with TemporaryDirectory(dir=output.parent, prefix='.pycrown_v1_') as staging:
             folder = Path(staging)
-            classified_points = write_results(folder, grid, result, export_las=export_las)
+            classified_points = write_results(
+                folder, grid, result, export_las=export_las, settings=settings,
+            )
             summary = {
                 'settings': asdict(settings), 'crs': grid.crs.to_string(), 'pixel_size_m': grid.pixel_size,
                 'peak_count': result.peak_count, 'seed_count': result.seed_count, 'tree_count': len(result.initial),
                 'moved_tops': int(np.count_nonzero(np.any(result.corrected != result.initial, axis=1))),
                 'crown_area_m2': float(np.count_nonzero(result.labels) * grid.pixel_size ** 2),
                 'classified_lidar_points': classified_points,
+                'point_instance_export': grid._cache.get('instance_export'),
+                'pointcloud_height_reference': grid._cache.get('pointcloud_height_reference'),
+                'pointcloud_supplement_used': bool(settings.use_pointcloud_supplement and
+                                                   grid._cache.get('pointcloud_supplement_valid_points', 0)),
                 'timing_s': {
                     'read': loaded - start, 'segment': segmented - loaded,
                     'total': perf_counter() - start,

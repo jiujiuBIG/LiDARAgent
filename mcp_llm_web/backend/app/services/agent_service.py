@@ -3,7 +3,13 @@ import re
 from typing import Dict, Any, Optional, List, AsyncIterator
 from app.services.llm_service import llm_service
 from pydantic import BaseModel
-from app.services.mcp_service import NORMALS_TOOL, PYCROWN_TOOL, WATERSHED_TOOL, mcp_service
+from app.services.mcp_service import (
+    NORMALS_TOOL,
+    PYCROWN_TOOL,
+    RASTER_PRODUCT_TOOLS,
+    WATERSHED_TOOL,
+    mcp_service,
+)
 
 
 class AgentThought(BaseModel):
@@ -40,8 +46,8 @@ SYSTEM_PROMPT = """你是一个专业的林业生态分析助手，专注于森�
 - **convert_point_cloud_format** - 格式转换，支持多种点云格式转换
 
 ### 森林参数提取工具（每个工具独立运行）
-- **extract_forest_dbh** - 树干直径（DBH）提取，从点云中计算树木胸径，单位：米
-- **extract_tree_height** - 树高提取，测量单木高度和冠层结构，单位：米
+- **extract_forest_dbh** - 需使用保留树干且带米制离地高度字段的单木点云，测量离地 1.2–1.4 米截面的胸径
+- **extract_tree_height** - 提取单木 Z 值统计和 P95−P05 垂直跨度。仅在结果提供离地树高指标时汇报树高
 - **extract_tree_crown** - 冠幅提取，计算树冠投影面积和尺寸（长轴和短轴），单位：米
 - **compute_diversity_index** - 多样性指数计算，分析森林物种多样性
 - **extract_filling_index** - 填充指数，计算林冠填充度（canopy filling index）
@@ -207,7 +213,7 @@ class AgentService:
                 }
             )
 
-            if tool_name in (NORMALS_TOOL, WATERSHED_TOOL, PYCROWN_TOOL):
+            if tool_name in (NORMALS_TOOL, WATERSHED_TOOL, PYCROWN_TOOL) or tool_name in RASTER_PRODUCT_TOOLS:
                 tool_result = await mcp_service.call_tool(
                     tool_name, message, file_context, arguments=tool_call_info.get("arguments")
                 )
@@ -216,13 +222,13 @@ class AgentService:
             normal_error = tool_name == NORMALS_TOOL and tool_result.get("status") == "error"
             watershed_error = tool_name == WATERSHED_TOOL and tool_result.get("status") == "error"
             pycrown_error = tool_name == PYCROWN_TOOL and tool_result.get("status") == "error"
-            tool_error = normal_error or watershed_error or pycrown_error
+            tool_error = tool_result.get("status") == "error"
             actual_arguments = {}
             if tool_name == NORMALS_TOOL and not normal_error:
                 normal_data = tool_result["data"]
                 actual_arguments = {
                     key: normal_data[key]
-                    for key in ("radius", "max_nn", "orientation", "label_schema")
+                    for key in ("radius", "max_nn", "orientation", "label_schema", "tile_size")
                     if key in normal_data
                 }
             elif tool_name == WATERSHED_TOOL and not watershed_error:
@@ -253,7 +259,8 @@ class AgentService:
                     "thought": (
                         "法向量估计未完成" if normal_error
                         else ("分水岭分割未完成" if watershed_error
-                              else ("PyCrown 分割未完成" if pycrown_error else f"✅ 工具 {tool_name} 执行完成"))
+                              else ("PyCrown 分割未完成" if pycrown_error
+                                    else (f"工具 {tool_name} 未完成" if tool_error else f"✅ 工具 {tool_name} 执行完成")))
                     ),
                     "tool_calls": [tool_name],
                     "progress": 60,

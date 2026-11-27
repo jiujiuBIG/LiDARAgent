@@ -13,6 +13,11 @@ import rasterio
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
+if __package__:
+    from .spatial_inputs import validate_chm, validate_point_cloud_alignment
+else:
+    from spatial_inputs import validate_chm, validate_point_cloud_alignment
+
 try:
     from tools.Segmentation.pycrown_v1 import (
         Grid,
@@ -59,25 +64,28 @@ def _load_grid_from_raster(
     dtm_path: str | None,
     las_path: Path | None,
 ) -> Grid:
-    dsm_cand = Path(dsm_path) if dsm_path else _find_sibling_raster(chm_path, "dsm")
-    dtm_cand = Path(dtm_path) if dtm_path else _find_sibling_raster(chm_path, "dtm")
-    if dsm_cand is not None and dtm_cand is not None and dsm_cand.is_file() and dtm_cand.is_file():
+    if dsm_path is not None or dtm_path is not None:
+        if not dtm_path:
+            raise ValueError("提供 DSM 时也需要同一网格的 DTM。")
+        dsm_cand, dtm_cand = Path(dsm_path) if dsm_path else None, Path(dtm_path)
+        for candidate in (dsm_cand, dtm_cand):
+            if candidate is not None and not candidate.is_file():
+                raise ValueError(f"辅助栅格不可用：{candidate.name}")
+    else:
+        dsm_cand = _find_sibling_raster(chm_path, "dsm")
+        dtm_cand = _find_sibling_raster(chm_path, "dtm")
+    if dtm_cand is not None:
         return read_grids(chm_path, dsm_cand, dtm_cand, las_path=las_path)
 
     with rasterio.open(chm_path) as src:
-        if src.count != 1:
-            raise ValueError(f"请提供单波段 CHM GeoTIFF: {chm_path}")
-        crs = src.crs
+        crs = validate_chm(src, square_pixels=True)
         transform = src.transform
-        if crs is None or not crs.is_projected or not np.isclose(crs.linear_units_factor[1], 1):
-            raise ValueError("输入栅格必须使用米制投影坐标系。")
-        if transform.b != 0 or transform.d != 0 or transform.a <= 0 or not np.isclose(transform.a, -transform.e):
-            raise ValueError("输入栅格必须为正北朝向且像元为正方形。")
+        bounds = src.bounds
         values = src.read(1, masked=True).astype(np.float32)
         physical = values.filled(np.nan) * src.scales[0] + src.offsets[0]
         chm = np.where(np.isfinite(physical), physical, np.nan)
 
-    dtm = np.zeros_like(chm, dtype=np.float32)
+    dtm = np.full_like(chm, np.nan, dtype=np.float32)
     dsm = np.where(np.isfinite(chm), chm, 0.0).astype(np.float32)
     resolved_las = las_path
     if resolved_las is None:
@@ -86,6 +94,8 @@ def _load_grid_from_raster(
             if cand.is_file():
                 resolved_las = cand
                 break
+    if resolved_las is not None:
+        validate_point_cloud_alignment(resolved_las, crs, bounds)
     return Grid(chm, np.isfinite(chm), dsm, dtm, transform, crs, las_path=resolved_las)
 
 
@@ -107,10 +117,13 @@ async def segment_trees_pycrown(
 ) -> dict:
     """Segment individual tree crowns using PyCrown (Dalponte circular region growing + steep-slope correction).
 
-    Accepts either a point cloud (.las/.laz) or an aligned CHM GeoTIFF (.tif/.tiff, optionally paired with DSM/DTM
-    and point_cloud_path). Uses normalized Gaussian peak detection with shoulder-branch suppression, optional 3D
+    Accepts a point cloud or a CHM GeoTIFF with optional aligned DTM, DSM and point cloud.
+    Three-dimensional recovery uses a DTM, classified ground on direct LAS input, or an explicit LAS height-above-ground field.
+    Uses normalized Gaussian peak detection with shoulder-branch suppression, optional 3D
     stem-to-crown understory recovery, Dalponte circular crown delineation, steep-slope treetop correction, and
     first-return Otsu convex-hull crown smoothing with classified LAS export.
+    With point-cloud input and LAS export enabled, tree_instances.las preserves source points and appends
+    the height above ground and supported tree IDs. Unassigned points keep ID zero.
     """
     try:
         for val, label_name, allow_zero in (
@@ -165,7 +178,10 @@ async def segment_trees_pycrown(
 
             with TemporaryDirectory(prefix=".pycrown_mcp_", dir=out_dir) as tmp:
                 staging = Path(tmp)
-                classified_points = write_results(staging, grid, result, export_las=bool(export_las))
+                classified_points = write_results(
+                    staging, grid, result, export_las=bool(export_las),
+                    settings=settings,
+                )
                 heights = (
                     result.surface[result.corrected.astype(int)[:, 0], result.corrected.astype(int)[:, 1]].tolist()
                     if len(result.corrected)
@@ -176,14 +192,18 @@ async def segment_trees_pycrown(
                 pixel_area = float(grid.pixel_size ** 2)
                 crown_areas = (counts * pixel_area).tolist()
                 moved_tops = int(np.count_nonzero(np.any(result.corrected != result.initial, axis=1)))
-                pointcloud_used = bool(settings.use_pointcloud_supplement and grid.las_path is not None)
+                valid_3d_points = grid._cache.get("pointcloud_supplement_valid_points", 0)
+                pointcloud_used = bool(settings.use_pointcloud_supplement and valid_3d_points)
 
                 summary_data = {
                     "algorithm": "PyCrown (Gaussian + 3D stem supplement + Dalponte circular + steep-slope correction)",
                     "input_type": "point_cloud" if ext in (".las", ".laz") else "chm_raster",
                     "pointcloud_supplement_used": pointcloud_used,
+                    "pointcloud_height_reference": grid._cache.get("pointcloud_height_reference"),
+                    "pointcloud_supplement_valid_points": valid_3d_points if settings.use_pointcloud_supplement else 0,
                     "smooth_crowns_exported": bool(grid.las_path is not None and (staging / "crowns_smooth.gpkg").is_file()),
                     "classified_lidar_points": int(classified_points),
+                    "point_instance_export": grid._cache.get("instance_export"),
                     "tree_count": int(len(result.initial)),
                     "peak_count": int(result.peak_count),
                     "seed_count": int(result.seed_count),
@@ -207,21 +227,28 @@ async def segment_trees_pycrown(
                     encoding="utf-8",
                 )
 
-                for item in staging.iterdir():
+                written_files = []
+                for item in sorted(staging.iterdir()):
+                    if not item.is_file():
+                        continue
                     target = out_dir / item.name
                     if not target.exists():
                         item.replace(target)
+                        written_files.append(target)
+                    else:
+                        written_files.append(item)
 
                 with zipfile.ZipFile(zip_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                    for item in sorted(out_dir.iterdir()):
-                        if item != zip_file and item.is_file():
-                            zf.write(item, arcname=item.name)
+                    for item in written_files:
+                        zf.write(item, arcname=item.name)
 
         mode_desc = (
-            "（含 3D 树干回溯补点与首回波凸包平滑）"
+            "（已使用有地面基准的点云进行 3D 树干补检）"
             if pointcloud_used
-            else "（纯 2D 栅格模式）"
+            else "（树顶分割使用 2D 栅格）"
         )
+        if settings.use_pointcloud_supplement and grid.las_path is not None and not pointcloud_used:
+            mode_desc += "。点云缺少可用的离地高程，已跳过 3D 补检"
         message = (
             f"PyCrown 单木分割完成，共分割出 {summary_data['tree_count']} 棵单木{mode_desc}。"
             f"平均树高 {summary_data['height_mean_m']:.2f} m（最高 {summary_data['height_max_m']:.2f} m），"

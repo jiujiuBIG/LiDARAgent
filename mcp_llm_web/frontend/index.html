@@ -117,6 +117,8 @@
         setMessages([]);
         setThoughts([]);
         setVisualization(null);
+        setUsedFile(null);
+        setFiles([]);
       };
 
       const selectSession = (session) => {
@@ -124,6 +126,8 @@
         setMessages([]);
         setThoughts([]);
         setVisualization(null);
+        setUsedFile(null);
+        setFiles([]);
         loadMessages(session.id);
       };
 
@@ -169,7 +173,7 @@
           }
           const data = await res.json();
           console.log('Upload success:', data);
-          setUploadedFiles(prev => [...prev, data]);
+          setUploadedFiles(prev => [...prev, { ...data, id: data.file_id }]);
           return data.file_id;
         } catch (e) {
           console.error('上传文件失败:', e);
@@ -196,20 +200,6 @@
         setFiles(prev => prev.filter((_, i) => i !== index));
       };
 
-      // 获取最近上传的文件
-      const getLatestFile = async () => {
-        try {
-          const res = await fetch(`${API_BASE}/files/list`);
-          const data = await res.json();
-          if (data.files && data.files.length > 0) {
-            return data.files[0].id;  // 返回最近的文件
-          }
-        } catch (e) {
-          console.error('获取最近文件失败:', e);
-        }
-        return null;
-      };
-
       const handleSend = async () => {
         if (!input.trim() && files.length === 0) return;
 
@@ -218,29 +208,29 @@
         setMessages(prev => [...prev, userMessage]);
 
         try {
-          let fileIds = [];
+          const fileIds = [];
+          const selectedFile = files.length === 0 ? usedFile : null;
 
           // 如果有新拖拽的文件，先上传
           for (const file of files) {
             const fileId = await uploadFile(file);
-            if (fileId) fileIds.push(fileId);
+            if (!fileId) return;
+            fileIds.push(fileId);
+          }
+          if (files.length === 1) {
+            const file = files[0];
+            setUsedFile({
+              id: fileIds[0],
+              filename: file.name,
+              file_type: file.name.split('.').pop(),
+              file_size: file.size
+            });
+          } else if (files.length > 1) {
+            setUsedFile(null);
           }
           setFiles([]);
 
-          // 如果没有新文件，获取最近上传的文件
-          if (fileIds.length === 0) {
-            const latestFileId = await getLatestFile();
-            if (latestFileId) {
-              fileIds = [latestFileId];
-              // 获取文件的详细信息
-              const filesRes = await fetch(`${API_BASE}/files/list`);
-              const filesData = await filesRes.json();
-              const latestFile = filesData.files?.find(f => f.id === latestFileId);
-              if (latestFile) {
-                setUsedFile(latestFile);
-              }
-            }
-          }
+          if (selectedFile?.id) fileIds.push(selectedFile.id);
 
           const sessionId = currentSession?.id || undefined;
           const res = await fetch(`${API_BASE}/chat/send`, {
@@ -249,11 +239,15 @@
             body: JSON.stringify({
               message: input,
               session_id: sessionId,
-              file_ids: fileIds
+              file_ids: fileIds,
+              result_message_id: selectedFile?.result_message_id ?? null
             })
           });
 
           const data = await res.json();
+          if (!res.ok) {
+            throw new Error(typeof data.detail === 'string' ? data.detail : '发送消息失败，请稍后重试。');
+          }
           setCurrentSession({ id: data.session_id, title: input.slice(0, 30) + '...' });
           loadSessions();
 
@@ -265,6 +259,7 @@
             timestamp: new Date().toISOString(),
             thoughts: data.thoughts,
             download_url: data.download_url,
+            reusable_result: data.reusable_result,
             tool_data: toolData
           }]);
           setThoughts(data.thoughts || []);
@@ -274,7 +269,7 @@
           console.error('发送消息失败:', e);
           setMessages(prev => [...prev, {
             role: 'assistant',
-            content: '抱歉，发生了错误。请稍后重试。',
+            content: e.message || '发送消息失败，请稍后重试。',
             timestamp: new Date().toISOString()
           }]);
         } finally {
@@ -415,8 +410,24 @@
                                   download
                                   className="inline-flex mt-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm font-medium text-emerald-800 hover:bg-emerald-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-600"
                                 >
-                                  下载 LAS
+                                  下载成果
                                 </a>
+                              )}
+                              {msg.reusable_result && (
+                                <button
+                                  type="button"
+                                  onClick={() => setUsedFile({
+                                    result_message_id: msg.reusable_result.message_id,
+                                    filename: msg.reusable_result.filename,
+                                    file_type: {
+                                      crown_points: '树冠点云',
+                                      tree_instances: '单木实例点云'
+                                    }[msg.reusable_result.kind] || '点云成果'
+                                  })}
+                                  className="mt-3 ml-2 rounded-lg border border-gray-200 px-3 py-2 text-sm hover:bg-gray-50"
+                                >
+                                  使用成果续算
+                                </button>
                               )}
                               <p className="text-xs text-gray-400 mt-2">{formatTime(msg.timestamp)}</p>
                             </div>
@@ -515,10 +526,20 @@
                         {/* 当前使用的文件 */}
                         {usedFile && (
                           <div className="mb-4">
-                            <p className="text-xs font-medium text-gray-500 mb-2">🔧 正在处理</p>
+                            <p className="text-xs font-medium text-gray-500 mb-2">已选输入</p>
                             <div className="bg-forest-50 border border-forest-200 px-3 py-2 rounded-lg">
                               <p className="text-sm font-medium text-forest DEFAULT">{usedFile.filename}</p>
-                              <p className="text-xs text-gray-500">{usedFile.file_type} · {formatFileSize(usedFile.file_size)}</p>
+                              <p className="text-xs text-gray-500">
+                                {usedFile.file_type}
+                                {typeof usedFile.file_size === 'number' && ` · ${formatFileSize(usedFile.file_size)}`}
+                              </p>
+                              <button
+                                type="button"
+                                onClick={() => setUsedFile(null)}
+                                className="mt-1 text-xs text-gray-600 underline"
+                              >
+                                清除选择
+                              </button>
                             </div>
                           </div>
                         )}
@@ -623,13 +644,21 @@
                               </div>
                             </div>
                             <div className="mt-2 flex gap-2">
-                              <button className="flex-1 py-1 text-xs bg-gray-100 text-gray-600 rounded hover:bg-gray-200">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setUsedFile(file);
+                                  setActiveTab('chat');
+                                }}
+                                className="flex-1 py-1 text-xs bg-gray-100 text-gray-600 rounded hover:bg-gray-200"
+                              >
                                 使用此文件
                               </button>
                               <button
                                 onClick={async () => {
                                   if (confirm('确定删除此文件？')) {
                                     await fetch(`${API_BASE}/files/${file.id}`, { method: 'DELETE' });
+                                    if (usedFile?.id === file.id) setUsedFile(null);
                                     loadUploadedFiles();
                                   }
                                 }}

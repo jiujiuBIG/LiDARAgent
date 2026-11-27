@@ -5,9 +5,11 @@ current_file = os.path.abspath(__file__)
 project_root = os.path.dirname(os.path.dirname(current_file))
 sys.path.insert(0, project_root)
 import numpy as np
-import open3d as o3d
 import laspy
 import pandas as pd
+from tools.Segmentation.point_instances import HEIGHT_ABOVE_GROUND_FIELDS, TREE_INSTANCE_DIMENSION
+
+TREE_ID_ALIASES = (TREE_INSTANCE_DIMENSION, "treeid", "tree_id", "predinstance")
 
 
 def _ensure_float64(series):
@@ -22,6 +24,8 @@ def read_point_cloud(file_path, is_treeid=True):
 
     # ---------- 1. PLY ----------
     if ext == ".ply":
+        import open3d as o3d
+
         pcd = o3d.io.read_point_cloud(file_path)
         points = np.asarray(pcd.points)
         data = pd.DataFrame(points, columns=["x", "y", "z"])
@@ -47,10 +51,14 @@ def read_point_cloud(file_path, is_treeid=True):
             attr_name = dimension.name
             if attr_name not in ["X", "Y", "Z"]:
                 attr_value = getattr(las, attr_name)
+                column = attr_name.lower()
                 # Convert SubFieldView to numpy array
                 if not isinstance(attr_value, np.ndarray):
                     attr_value = np.array(attr_value)
                 attr_series = pd.Series(attr_value)
+                if is_treeid and column in TREE_ID_ALIASES:
+                    df[column] = attr_series
+                    continue
                 # Convert to float64 for numeric columns
                 if attr_name.lower() in [
                     "intensity",
@@ -69,9 +77,15 @@ def read_point_cloud(file_path, is_treeid=True):
                     "green",
                     "blue",
                 ]:
-                    df[attr_name.lower()] = attr_series.astype(np.float64)
+                    df[column] = attr_series.astype(np.float64)
                 else:
-                    df[attr_name.lower()] = _ensure_float64(attr_series)
+                    df[column] = _ensure_float64(attr_series)
+
+        if is_treeid:
+            for column in TREE_ID_ALIASES:
+                if column in df:
+                    df["treeid"] = df[column]
+                    break
 
         return df
 

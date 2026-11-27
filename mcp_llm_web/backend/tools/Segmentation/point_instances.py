@@ -1,4 +1,4 @@
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import laspy
@@ -15,6 +15,7 @@ CROWN_HEIGHT_FRACTION = 0.4
 STEM_ASSIGNMENT_RADIUS_M = 0.55
 TREETOP_HEIGHT_TOLERANCE_M = 1.5
 CROWN_NEIGHBOUR_RADIUS_M = 1.0
+MIN_SEPARATED_CROWN_PIXELS = 2
 
 
 def las_height_above_ground(las) -> np.ndarray | None:
@@ -98,6 +99,47 @@ def _sample_crown_ids(xy, crown_ids, transform):
     ids = np.zeros(len(xy), dtype=np.int32)
     ids[inside] = crown_ids[row[inside], col[inside]]
     return ids
+
+
+def select_separated_crown_tops(stem_positions, traced_tops, crown_ids, chm, transform, treetops):
+    """Recover a visible lower crown only when another stem explains its upper crown."""
+    if not len(stem_positions) or not traced_tops or not treetops:
+        return []
+
+    anchors = np.asarray(stem_positions, dtype=float)
+    owners = _sample_crown_ids(anchors, crown_ids, transform)
+    caps_by_crown = defaultdict(list)
+    for stem_id, cap in traced_tops.items():
+        owner = owners[stem_id]
+        if owner in treetops and cap is not None and np.isfinite(cap).all():
+            caps_by_crown[owner].append((stem_id, np.asarray(cap, dtype=float)))
+
+    all_tops = np.asarray(list(treetops.values()), dtype=float)
+    inverse = ~transform
+    accepted = []
+    for owner, caps in caps_by_crown.items():
+        if len(caps) < 2:
+            continue
+        incumbent = np.asarray(treetops[owner], dtype=float)
+        dominant, upper = min(caps, key=lambda item: np.linalg.norm(item[1] - incumbent))
+        if np.linalg.norm(upper[:2] - incumbent[:2]) > 2.0 or abs(upper[2] - incumbent[2]) > 3.0:
+            continue
+        for stem_id, cap in caps:
+            if stem_id == dominant or cap[2] < 10.0 or upper[2] - cap[2] < 2.5:
+                continue
+            if np.linalg.norm(upper[:2] - cap[:2]) < 0.75:
+                continue
+            if np.any(
+                (np.linalg.norm(all_tops[:, :2] - cap[:2], axis=1) < 0.75)
+                & (np.abs(all_tops[:, 2] - cap[2]) <= TREETOP_HEIGHT_TOLERANCE_M)
+            ):
+                continue
+            col, row = np.floor(inverse * tuple(cap[:2])).astype(int)
+            if not (0 <= row < chm.shape[0] and 0 <= col < chm.shape[1]):
+                continue
+            if crown_ids[row, col] == owner and abs(chm[row, col] - cap[2]) <= 2.0:
+                accepted.append(tuple(float(value) for value in cap))
+    return sorted(accepted, key=lambda point: (-point[2], point[0], point[1]))
 
 
 def _resolve_overlapping_crowns(cloud, selected, labels, crown_ceiling, stem_top_m):

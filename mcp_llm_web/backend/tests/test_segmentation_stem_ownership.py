@@ -45,3 +45,26 @@ def test_short_crown_does_not_take_upper_canopy_from_neighbour():
         traced_labels=np.array([0, 7, 0, 7, 0], dtype=np.int32),
     )
     np.testing.assert_array_equal(labels, [8, 8, 8, 7, 0])
+
+
+def test_lower_crown_recovery_requires_independent_stems_and_a_visible_cap():
+    from tools.Segmentation.point_instances import select_separated_crown_tops
+
+    raster = np.full((4, 7), 7, dtype=np.int32)
+    heights = np.full(raster.shape, 22.0)
+    heights[1, 3] = 17.5
+    stems = [(1.5, 1.5), (3.5, 1.5), (5.5, 1.5)]
+    traces = {0: (1.5, 1.5, 21), 1: (3.5, 1.5, 17), 2: (5.5, 1.5, 16)}
+    crowns = {7: (1.5, 1.5, 22)}
+
+    assert select_separated_crown_tops(stems, traces, raster, heights, Affine.identity(), crowns) == [
+        (3.5, 1.5, 17),
+    ]
+    # A low cap within the only stem's crown can be a branch, even if visible.
+    assert not select_separated_crown_tops(
+        stems[1:2], {0: traces[1]}, raster, heights, Affine.identity(), crowns,
+    )
+    # Two low traces provide no independent support for the incumbent crown.
+    assert not select_separated_crown_tops(
+        stems, {**traces, 0: (1.5, 1.5, 18)}, raster, heights, Affine.identity(), crowns,
+    )

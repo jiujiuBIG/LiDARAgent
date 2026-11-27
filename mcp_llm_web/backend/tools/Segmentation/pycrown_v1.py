@@ -25,10 +25,16 @@ from shapely.geometry import Point, Polygon
 from skimage.filters import threshold_otsu
 
 if __package__:
-    from .point_instances import label_crown_and_stem_instances, label_traced_instances, las_height_above_ground, write_instance_cloud
+    from .point_instances import (
+        MIN_SEPARATED_CROWN_PIXELS, label_crown_and_stem_instances, label_traced_instances,
+        las_height_above_ground, select_separated_crown_tops, write_instance_cloud,
+    )
     from .spatial_inputs import require_metric_crs, validate_chm, validate_point_cloud_alignment
 else:
-    from point_instances import label_crown_and_stem_instances, label_traced_instances, las_height_above_ground, write_instance_cloud
+    from point_instances import (
+        MIN_SEPARATED_CROWN_PIXELS, label_crown_and_stem_instances, label_traced_instances,
+        las_height_above_ground, select_separated_crown_tops, write_instance_cloud,
+    )
     from spatial_inputs import require_metric_crs, validate_chm, validate_point_cloud_alignment
 
 try:
@@ -1178,9 +1184,47 @@ def grow_crowns(grid, surface, centres, peak_count, settings):
 
 
 def segment(grid, settings):
+    grid._cache.pop('separated_crown_count', None)
     surface = smooth_chm(grid, settings)
     peaks, peak_count = find_candidates(grid, surface, settings)
-    return grow_crowns(grid, surface, peaks, peak_count, settings)
+    provisional = grow_crowns(grid, surface, peaks, peak_count, settings)
+    evidence = grid._cache.get('stem_evidence')
+    if not evidence or not len(provisional.initial):
+        return provisional
+
+    heights = grid._cache.get('supplement_heights', {})
+    treetops = {
+        index: (*xy, heights.get(tuple(seed.astype(int)), float(grid.chm[tuple(seed.astype(int))])))
+        for index, (xy, seed) in enumerate(zip(world_points(grid.transform, provisional.initial), provisional.initial), 1)
+    }
+    stems = evidence['stems']
+    traces = _resolve_traced_tops(evidence, list(range(len(stems))))
+    tops = select_separated_crown_tops(stems, traces, provisional.labels, grid.chm, grid.transform, treetops)
+    occupied = {tuple(seed.astype(int)) for seed in peaks}
+    additions = []
+    inverse = ~grid.transform
+    for x, y, height in tops:
+        col, row = inverse * (x, y)
+        cell = (int(row), int(col))
+        if cell not in occupied and height >= settings.min_final_tree_m and provisional.surface[cell] >= settings.min_final_tree_m:
+            additions.append(((row, col), height))
+            occupied.add(cell)
+
+    while additions:
+        seeds = np.array([seed for seed, _ in additions])
+        trial = grow_crowns(grid, surface, np.vstack((peaks, seeds)), peak_count + len(seeds), settings)
+        first_id = len(provisional.initial) + 1
+        sizes = np.bincount(trial.labels.ravel(), minlength=first_id + len(seeds))
+        kept = [item for index, item in enumerate(additions, first_id)
+                if sizes[index] >= MIN_SEPARATED_CROWN_PIXELS]
+        if len(kept) == len(additions):
+            grid._cache.setdefault('supplement_heights', {}).update(
+                {tuple(int(value) for value in seed): height for seed, height in additions}
+            )
+            grid._cache['separated_crown_count'] = len(additions)
+            return trial
+        additions = kept
+    return provisional
 
 
 def world_points(transform, centres):

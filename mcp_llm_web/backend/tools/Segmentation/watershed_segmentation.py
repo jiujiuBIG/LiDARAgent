@@ -33,10 +33,16 @@ from skimage.measure import label as sk_label
 from skimage.segmentation import watershed
 
 if __package__:
-    from .point_instances import label_crown_and_stem_instances, label_traced_instances, las_height_above_ground, write_instance_cloud
+    from .point_instances import (
+        MIN_SEPARATED_CROWN_PIXELS, label_crown_and_stem_instances, label_traced_instances,
+        las_height_above_ground, select_separated_crown_tops, write_instance_cloud,
+    )
     from .spatial_inputs import require_metric_crs, validate_chm, validate_point_cloud_alignment
 else:
-    from point_instances import label_crown_and_stem_instances, label_traced_instances, las_height_above_ground, write_instance_cloud
+    from point_instances import (
+        MIN_SEPARATED_CROWN_PIXELS, label_crown_and_stem_instances, label_traced_instances,
+        las_height_above_ground, select_separated_crown_tops, write_instance_cloud,
+    )
     from spatial_inputs import require_metric_crs, validate_chm, validate_point_cloud_alignment
 
 mcp = FastMCP("WatershedTreeCrownSegmentation")
@@ -679,6 +685,36 @@ def supplement_treetops_from_cloud(baseline_points, cloud: np.ndarray, instance_
     return merged, len(merged) - len(baseline_points)
 
 
+def recover_separated_crowns(markers, labels, heights, mask, transform, treetops_by_id, evidence):
+    tops = {index: top[:3] for index, top in treetops_by_id.items()}
+    candidates = select_separated_crown_tops(evidence["stems"], evidence["tops"], labels, heights, transform, tops)
+    occupied = set(zip(*np.nonzero(markers)))
+    additions = []
+    for top in candidates:
+        cell = rasterio.transform.rowcol(transform, *top[:2])
+        if cell not in occupied:
+            additions.append((cell, top))
+            occupied.add(cell)
+
+    surface = np.where(mask, -heights, 0.0)
+    first_id = len(treetops_by_id) + 1
+    while additions:
+        trial_markers = markers.copy()
+        for index, (cell, _) in enumerate(additions, first_id):
+            trial_markers[cell] = index
+        trial_labels = watershed(surface, trial_markers, mask=mask, connectivity=1, watershed_line=False)
+        sizes = np.bincount(trial_labels.ravel(), minlength=first_id + len(additions))
+        kept = [item for index, item in enumerate(additions, first_id)
+                if sizes[index] >= MIN_SEPARATED_CROWN_PIXELS]
+        if len(kept) == len(additions):
+            treetops_by_id.update({
+                index: (*top, "stem_to_crown_3d") for index, (_, top) in enumerate(additions, first_id)
+            })
+            return trial_markers, trial_labels, len(additions)
+        additions = kept
+    return markers, labels, 0
+
+
 def write_crowns_vector(shp_path: Path, geojson_path: Path, labels: np.ndarray, heights: np.ndarray, treetops_by_id: dict, transform, crs, pixel_area: float):
     pos_mask = labels > 0
     pos_labels = labels[pos_mask]
@@ -824,7 +860,7 @@ async def segment_trees_watershed(
 
         supplemented_count = 0
         all_points = list(baseline_points)
-        instance_evidence = {} if export_las else None
+        instance_evidence = {}
         pointcloud_used = bool(use_pointcloud_supplement and cloud is not None and np.isfinite(cloud[:, 2]).any())
         if pointcloud_used:
             all_points, supplemented_count = supplement_treetops_from_cloud(
@@ -846,6 +882,11 @@ async def segment_trees_watershed(
         seeds = markers > 0
         surface = np.where(mask, -heights, 0.0)
         labels = watershed(surface, markers, mask=mask, connectivity=1, watershed_line=False) if seeds.any() else markers.copy()
+        separated_count = 0
+        if instance_evidence and treetops_by_id:
+            markers, labels, separated_count = recover_separated_crowns(
+                markers, labels, heights, mask, transform, treetops_by_id, instance_evidence,
+            )
 
         out_dir = Path(output_path).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -951,6 +992,7 @@ async def segment_trees_watershed(
                 "tree_count": len(records),
                 "chm_seed_count": chm_seed_count,
                 "stem_supplemented_count": supplement_seed_count,
+                "separated_crown_count": separated_count,
                 "sigma_m": float(sigma_m),
                 "min_distance_m": float(min_distance_m),
                 "min_canopy_height_m": float(min_canopy_height_m),

@@ -204,6 +204,7 @@ async def segment_trees_pycrown(
                     "smooth_crowns_exported": bool(grid.las_path is not None and (staging / "crowns_smooth.gpkg").is_file()),
                     "classified_lidar_points": int(classified_points),
                     "point_instance_export": grid._cache.get("instance_export"),
+                    "separated_crown_count": grid._cache.get("separated_crown_count", 0),
                     "tree_count": int(len(result.initial)),
                     "peak_count": int(result.peak_count),
                     "seed_count": int(result.seed_count),

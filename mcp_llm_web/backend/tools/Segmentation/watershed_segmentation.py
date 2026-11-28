@@ -35,13 +35,13 @@ from skimage.segmentation import watershed
 if __package__:
     from .point_instances import (
         MIN_SEPARATED_CROWN_PIXELS, label_crown_and_stem_instances, label_traced_instances,
-        las_height_above_ground, select_separated_crown_tops, write_instance_cloud,
+        las_height_above_ground, recover_occluded_instances, select_separated_crown_tops, write_instance_cloud,
     )
     from .spatial_inputs import require_metric_crs, validate_chm, validate_point_cloud_alignment
 else:
     from point_instances import (
         MIN_SEPARATED_CROWN_PIXELS, label_crown_and_stem_instances, label_traced_instances,
-        las_height_above_ground, select_separated_crown_tops, write_instance_cloud,
+        las_height_above_ground, recover_occluded_instances, select_separated_crown_tops, write_instance_cloud,
     )
     from spatial_inputs import require_metric_crs, validate_chm, validate_point_cloud_alignment
 
@@ -52,6 +52,7 @@ HORIZONTAL_M = 0.25
 VERTICAL_M = 0.5
 SEED_BOTTOM_M = 1.5
 SEED_TOP_M = 6.5
+WATERSHED_COMPACTNESS = 0.5
 
 
 @dataclass(frozen=True)
@@ -623,40 +624,54 @@ def build_chm_and_normalized_cloud_from_las(source_path: Path, resolution: float
     crs_wkt = crs.to_wkt()
     del las
 
-    dsm_raw = _grid_reduce(x, y, z, minx, maxy, resolution, shape, "max")
     ground_mask = cls == 2
     del cls
     has_classified_ground = bool(np.any(ground_mask))
-    if has_classified_ground:
-        dtm_raw = _grid_reduce(x[ground_mask], y[ground_mask], z[ground_mask], minx, maxy, resolution, shape, "min")
-        dtm = median_filter(_fill_nearest(dtm_raw), size=3, mode="nearest")
-    elif float(np.percentile(z, 5)) >= -0.5 and float(np.percentile(z, 1)) <= 0.5:
-        dtm = np.zeros_like(dsm_raw)
-    else:
-        dtm_raw = _grid_reduce(x, y, z, minx, maxy, resolution, shape, "min")
-        dtm = median_filter(_fill_nearest(dtm_raw), size=3, mode="nearest")
-    del ground_mask
-
-    occ = np.isfinite(dsm_raw)
-    dist = distance_transform_edt(~occ, sampling=resolution)
-    dsm = _fill_nearest(dsm_raw)
-    dsm[dist > 1.0] = dtm[dist > 1.0]
-
-    chm = dsm - dtm
-    chm[~np.isfinite(chm)] = 0.0
-    chm[chm < 0] = 0.0
-
-    cols = np.clip(np.floor((x - minx) / resolution).astype(np.int32), 0, shape[1] - 1)
-    rows = np.clip(np.floor((maxy - y) / resolution).astype(np.int32), 0, shape[0] - 1)
-    # Elevation heuristics may construct a 2-D CHM. Only measured ground
-    # classes or explicit point heights can establish a 3-D height reference.
-    if has_classified_ground:
-        norm_z = z - dtm[rows, cols]
-    elif explicit_height is not None:
+    if not has_classified_ground and explicit_height is not None and np.isfinite(explicit_height).any():
+        finite_h = np.isfinite(explicit_height)
+        chm_raw = _grid_reduce(
+            x[finite_h], y[finite_h], explicit_height[finite_h], minx, maxy, resolution, shape, "max"
+        )
+        occ = np.isfinite(chm_raw)
+        dist = distance_transform_edt(~occ, sampling=resolution)
+        chm = _fill_nearest(chm_raw)
+        chm[dist > 1.0] = 0.0
+        chm[~np.isfinite(chm)] = 0.0
+        chm[chm < 0] = 0.0
         norm_z = explicit_height
+        del ground_mask, z
     else:
-        norm_z = np.full_like(z, np.nan)
-    del rows, cols, z
+        dsm_raw = _grid_reduce(x, y, z, minx, maxy, resolution, shape, "max")
+        if has_classified_ground:
+            dtm_raw = _grid_reduce(x[ground_mask], y[ground_mask], z[ground_mask], minx, maxy, resolution, shape, "min")
+            dtm = median_filter(_fill_nearest(dtm_raw), size=3, mode="nearest")
+        elif float(np.percentile(z, 5)) >= -0.5 and float(np.percentile(z, 1)) <= 0.5:
+            dtm = np.zeros_like(dsm_raw)
+        else:
+            dtm_raw = _grid_reduce(x, y, z, minx, maxy, resolution, shape, "min")
+            dtm = median_filter(_fill_nearest(dtm_raw), size=3, mode="nearest")
+        del ground_mask
+
+        occ = np.isfinite(dsm_raw)
+        dist = distance_transform_edt(~occ, sampling=resolution)
+        dsm = _fill_nearest(dsm_raw)
+        dsm[dist > 1.0] = dtm[dist > 1.0]
+
+        chm = dsm - dtm
+        chm[~np.isfinite(chm)] = 0.0
+        chm[chm < 0] = 0.0
+
+        cols = np.clip(np.floor((x - minx) / resolution).astype(np.int32), 0, shape[1] - 1)
+        rows = np.clip(np.floor((maxy - y) / resolution).astype(np.int32), 0, shape[0] - 1)
+        # Elevation heuristics may construct a 2-D CHM. Only measured ground
+        # classes or explicit point heights can establish a 3-D height reference.
+        if has_classified_ground:
+            norm_z = z - dtm[rows, cols]
+        elif explicit_height is not None:
+            norm_z = explicit_height
+        else:
+            norm_z = np.full_like(z, np.nan)
+        del rows, cols, z
     cloud = np.column_stack((x, y, norm_z))
     del x, y, norm_z
     return chm.astype(np.float64), occ, transform, crs_wkt, (resolution, resolution), cloud
@@ -702,7 +717,10 @@ def recover_separated_crowns(markers, labels, heights, mask, transform, treetops
         trial_markers = markers.copy()
         for index, (cell, _) in enumerate(additions, first_id):
             trial_markers[cell] = index
-        trial_labels = watershed(surface, trial_markers, mask=mask, connectivity=1, watershed_line=False)
+        trial_labels = watershed(
+            surface, trial_markers, mask=mask, connectivity=1, watershed_line=False,
+            compactness=WATERSHED_COMPACTNESS,
+        )
         sizes = np.bincount(trial_labels.ravel(), minlength=first_id + len(additions))
         kept = [item for index, item in enumerate(additions, first_id)
                 if sizes[index] >= MIN_SEPARATED_CROWN_PIXELS]
@@ -784,6 +802,7 @@ async def segment_trees_watershed(
     point_cloud_path: str | None = None,
     output_path: str = "./",
     export_las: bool = True,
+    recover_occluded_crowns: bool = True,
 ) -> dict:
     """Segment individual tree crowns using marker-controlled watershed on CHM with 3D stem-to-crown treetop recovery.
 
@@ -881,7 +900,14 @@ async def segment_trees_watershed(
 
         seeds = markers > 0
         surface = np.where(mask, -heights, 0.0)
-        labels = watershed(surface, markers, mask=mask, connectivity=1, watershed_line=False) if seeds.any() else markers.copy()
+        labels = (
+            watershed(
+                surface, markers, mask=mask, connectivity=1, watershed_line=False,
+                compactness=WATERSHED_COMPACTNESS,
+            )
+            if seeds.any()
+            else markers.copy()
+        )
         separated_count = 0
         if instance_evidence and treetops_by_id:
             markers, labels, separated_count = recover_separated_crowns(
@@ -979,9 +1005,17 @@ async def segment_trees_watershed(
                     stem_positions=(instance_evidence or {}).get("stems", ()), traced_labels=traced,
                     stem_top_m=SEED_TOP_M,
                 )
+                occluded_parents = {}
+                if recover_occluded_crowns and instance_evidence and treetops:
+                    point_ids, occluded_parents = recover_occluded_instances(
+                        cloud, point_ids, labels, transform, heights,
+                        instance_evidence["stems"], instance_evidence["tops"], treetops,
+                    )
                 instance_export = write_instance_cloud(
                     cloud_path, staging / "tree_instances.las", cloud[:, 2], point_ids,
                     method="crown_raster_and_verified_stems",
+                    summary_path=staging / "tree_summary.csv" if recover_occluded_crowns else None,
+                    occluded_parent_ids=occluded_parents,
                 )
 
             summary_data = {

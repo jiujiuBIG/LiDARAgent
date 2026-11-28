@@ -179,7 +179,7 @@ def _sample_crown_ids(xy, crown_ids, transform):
 
 
 def select_separated_crown_tops(stem_positions, traced_tops, crown_ids, chm, transform, treetops):
-    """Recover a visible lower crown only when another stem explains its upper crown."""
+    """Recover visible crowns supported by independent stems when another stem explains the incumbent crown."""
     if not len(stem_positions) or not traced_tops or not treetops:
         return []
 
@@ -202,20 +202,29 @@ def select_separated_crown_tops(stem_positions, traced_tops, crown_ids, chm, tra
         if np.linalg.norm(upper[:2] - incumbent[:2]) > 2.0 or abs(upper[2] - incumbent[2]) > 3.0:
             continue
         for stem_id, cap in caps:
-            if stem_id == dominant or cap[2] < 10.0 or upper[2] - cap[2] < 2.5:
+            if stem_id == dominant or cap[2] < 10.0:
                 continue
-            if np.linalg.norm(upper[:2] - cap[:2]) < 0.75:
+            is_lower = (upper[2] - cap[2]) >= 2.5
+            min_sep = 0.75 if is_lower else 1.0
+            if np.linalg.norm(upper[:2] - cap[:2]) < min_sep:
                 continue
+            if not is_lower and np.linalg.norm(anchors[dominant] - anchors[stem_id]) < 1.0:
+                continue
+            vertical_tol = TREETOP_HEIGHT_TOLERANCE_M if is_lower else 3.0
             if np.any(
-                (np.linalg.norm(all_tops[:, :2] - cap[:2], axis=1) < 0.75)
-                & (np.abs(all_tops[:, 2] - cap[2]) <= TREETOP_HEIGHT_TOLERANCE_M)
+                (np.linalg.norm(all_tops[:, :2] - cap[:2], axis=1) < min_sep)
+                & (np.abs(all_tops[:, 2] - cap[2]) <= vertical_tol)
             ):
                 continue
             col, row = np.floor(inverse * tuple(cap[:2])).astype(int)
             if not (0 <= row < chm.shape[0] and 0 <= col < chm.shape[1]):
                 continue
-            if crown_ids[row, col] == owner and abs(chm[row, col] - cap[2]) <= 2.0:
-                accepted.append(tuple(float(value) for value in cap))
+            target_crown = int(crown_ids[row, col])
+            if target_crown <= 0 or abs(chm[row, col] - cap[2]) > 2.0:
+                continue
+            if target_crown != owner and np.any(np.linalg.norm(all_tops[:, :2] - cap[:2], axis=1) < 1.25):
+                continue
+            accepted.append(tuple(float(value) for value in cap))
     return sorted(accepted, key=lambda point: (-point[2], point[0], point[1]))
 
 
@@ -245,8 +254,9 @@ def _resolve_overlapping_crowns(cloud, selected, labels, crown_ceiling, stem_top
     labels[points[near][compatible]] = owners[compatible]
 
 
-def _link_shared_stems(anchors, candidate_stems, targets):
-    """Keep stem-to-apex links that every maximum one-to-one matching requires."""
+def _link_shared_stems(anchors, candidate_stems, targets, anchor_ids=None):
+    """Keep stem-to-apex links that every maximum one-to-one matching requires,
+    plus unambiguous apex-centred stems inside a single unassigned crown."""
     assigned = np.zeros(len(anchors), dtype=np.int32)
     if not len(candidate_stems) or not targets:
         return assigned
@@ -269,6 +279,36 @@ def _link_shared_stems(anchors, candidate_stems, targets):
         if np.count_nonzero(alternative >= 0) < maximum:
             assigned[candidate_stems[row]] = tree_ids[matching[row]]
         graph.data[edge] = 1
+
+    if anchor_ids is not None:
+        used_trees = set(int(t) for t in assigned if t > 0)
+        remaining_trees = [int(t) for t in tree_ids if int(t) not in used_trees]
+        remaining_stems = [int(s) for s in candidate_stems if assigned[s] == 0]
+        if remaining_trees and remaining_stems:
+            rem_tops = np.asarray([targets[t][:2] for t in remaining_trees], dtype=float)
+            for t_idx, tree_id in enumerate(remaining_trees):
+                in_crown = [s for s in remaining_stems if int(anchor_ids[s]) == tree_id]
+                if not in_crown:
+                    continue
+                # Skip if any stem in this group also competes for another unassigned target within 2.0 m.
+                other_mask = np.arange(len(remaining_trees)) != t_idx
+                if np.any(other_mask):
+                    other_tops = rem_tops[other_mask]
+                    competing = any(
+                        np.any(np.linalg.norm(other_tops - anchors[s], axis=1) <= 2.0)
+                        for s in in_crown
+                    )
+                    if competing:
+                        continue
+                dists = sorted(
+                    (float(np.linalg.norm(anchors[s] - rem_tops[t_idx])), s)
+                    for s in in_crown
+                )
+                d_best, s_best = dists[0]
+                if d_best <= 0.65 and (
+                    len(dists) == 1 or (dists[1][0] >= d_best + 0.45 and dists[1][0] >= 2.0 * d_best)
+                ):
+                    assigned[s_best] = tree_id
     return assigned
 
 
@@ -322,7 +362,7 @@ def label_crown_and_stem_instances(
                 chest_ids = set(labels[selected[(heights >= BREAST_HEIGHT_MIN) & (heights <= BREAST_HEIGHT_MAX)]])
                 canopy_ids = set(labels[selected[heights > stem_top_m]])
                 missing_tops = {i: top for i, top in treetops.items() if i in canopy_ids and i not in chest_ids}
-                recovered = _link_shared_stems(anchors, missing_stems, missing_tops)[nearest]
+                recovered = _link_shared_stems(anchors, missing_stems, missing_tops, anchor_ids=anchor_ids)[nearest]
                 compatible = (crowns[points] == 0) | (crowns[points] == anchor_ids[nearest]) | (crowns[points] == recovered)
                 add = in_section & (point_ids == 0) & (recovered > 0) & compatible
                 labels[selected[points[add]]] = recovered[add]

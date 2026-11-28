@@ -185,6 +185,9 @@ def denoise_point_cloud(
     return _keep_primary_xy_cluster(denoised_points, radius_m=cluster_radius_m)
 
 
+MIN_CROWN_POINTS = 10
+
+
 def calculate_crown_ellipse_dimensions(points_3d: np.ndarray) -> dict:
     xy_points = points_3d[:, :2]
     if xy_points.shape[0] < 5:
@@ -267,7 +270,7 @@ async def extract_tree_crown(file_path: str, output_path: str = "./") -> dict:
         if not len(points):
             continue
         crown_points = points[points[:, 2] >= np.percentile(points[:, 2], 30)]
-        if len(crown_points) <= 3000:
+        if len(crown_points) < MIN_CROWN_POINTS:
             continue
         try:
             res = calculate_crown_ellipse_dimensions(crown_points)

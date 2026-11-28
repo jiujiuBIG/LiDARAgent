@@ -27,13 +27,13 @@ from skimage.filters import threshold_otsu
 if __package__:
     from .point_instances import (
         MIN_SEPARATED_CROWN_PIXELS, label_crown_and_stem_instances, label_traced_instances,
-        las_height_above_ground, select_separated_crown_tops, write_instance_cloud,
+        las_height_above_ground, recover_occluded_instances, select_separated_crown_tops, write_instance_cloud,
     )
     from .spatial_inputs import require_metric_crs, validate_chm, validate_point_cloud_alignment
 else:
     from point_instances import (
         MIN_SEPARATED_CROWN_PIXELS, label_crown_and_stem_instances, label_traced_instances,
-        las_height_above_ground, select_separated_crown_tops, write_instance_cloud,
+        las_height_above_ground, recover_occluded_instances, select_separated_crown_tops, write_instance_cloud,
     )
     from spatial_inputs import require_metric_crs, validate_chm, validate_point_cloud_alignment
 
@@ -73,6 +73,7 @@ class Settings:
     shoulder_min_h_diff_m: float = 3.0
     shoulder_min_tall_h_m: float = 27.0
     stem_candidate_radius_m: float = 1.5
+    recover_occluded_crowns: bool = True
 
     def __post_init__(self):
         if self.smoothing_filter not in ('gaussian', 'median'):
@@ -1416,9 +1417,17 @@ def write_results(folder, grid, result, export_las=True, *, settings=Settings())
                 stem_positions=(evidence or {}).get('stems', ()), traced_labels=traced,
                 stem_top_m=SEED_TOP_M,
             )
+            occluded_parents = {}
+            if settings.recover_occluded_crowns and evidence and treetops:
+                point_ids, occluded_parents = recover_occluded_instances(
+                    cloud, point_ids, result.labels, grid.transform, grid.chm,
+                    evidence['stems'], traced_tops, treetops,
+                )
             grid._cache['instance_export'] = write_instance_cloud(
                 grid.las_path, folder / 'tree_instances.las', heights, point_ids,
                 method="crown_raster_and_verified_stems",
+                summary_path=folder / 'tree_summary.csv' if settings.recover_occluded_crowns else None,
+                occluded_parent_ids=occluded_parents,
             )
     return classified_points
 

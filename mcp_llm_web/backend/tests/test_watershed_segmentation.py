@@ -91,8 +91,9 @@ def test_watershed_tool_recovers_understory_trees_on_c02(tmp_path):
     data = result["data"]
     assert data["pointcloud_supplement_used"] is True
     assert data["chm_seed_count"] == 13
-    assert data["stem_supplemented_count"] == 14
-    assert data["tree_count"] == 27
+    assert data["separated_crown_count"] == 3
+    assert data["stem_supplemented_count"] - data["separated_crown_count"] == 14
+    assert data["tree_count"] == 30
 
 
 class RecordingWatershedSession:

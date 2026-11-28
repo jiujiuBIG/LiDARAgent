@@ -245,6 +245,31 @@ def test_crown_denoise_drops_distant_stray_points_without_open3d(monkeypatch):
     assert float(np.max(cleaned[:, 1])) < 5.0
 
 
+def test_crown_measures_sparse_als_tree_and_skips_tiny_noise(tmp_path, monkeypatch):
+    tool = load_measurement("2.TreeCrown.py")
+    monkeypatch.setattr(tool, "o3d", None)
+    angles = np.linspace(0, 2 * np.pi, 80, endpoint=False)
+    sparse_x = 100.0 + 2.5 * np.cos(angles)
+    sparse_y = 200.0 + 1.5 * np.sin(angles)
+    sparse_z = np.linspace(4.0, 12.0, len(angles))
+    noise_x = np.array([150.0, 150.1, 150.2, 150.3, 150.4])
+    noise_y = np.array([250.0, 250.2, 250.1, 250.3, 250.0])
+    noise_z = np.array([5.0, 6.0, 7.0, 8.0, 9.0])
+    frame = pd.DataFrame({
+        "x": np.r_[sparse_x, noise_x],
+        "y": np.r_[sparse_y, noise_y],
+        "z": np.r_[sparse_z, noise_z],
+        "treeid": [1] * len(sparse_x) + [2] * len(noise_x),
+    })
+    monkeypatch.setattr(tool, "read_point_cloud", lambda *args, **kwargs: frame)
+    result = asyncio.run(tool.extract_tree_crown("sparse.las", str(tmp_path)))
+    assert result["status"] == "success", result
+    rows = pd.read_csv(result["output_path"]).set_index("treeid")
+    assert list(rows.index) == [1]
+    assert rows.loc[1, "major_axis_length"] == pytest.approx(5.0, abs=0.2)
+    assert rows.loc[1, "minor_axis_length"] == pytest.approx(3.0, abs=0.2)
+
+
 def test_instance_trace_preserves_points_and_leaves_ambiguous_unassigned(tmp_path):
     from tools.Segmentation.point_instances import label_traced_instances, write_instance_cloud
     from tools.Preprocessing.read import read_point_cloud

@@ -114,6 +114,9 @@ async def segment_trees_pycrown(
     dtm_path: str | None = None,
     point_cloud_path: str | None = None,
     output_path: str = "./",
+    recover_occluded_crowns: Annotated[
+        bool, Field(description="Enable 3D point-only occluded lower-crown recovery and tree_summary.csv when aligned point-cloud export is active."),
+    ] = True,
 ) -> dict:
     """Segment individual tree crowns using PyCrown (Dalponte circular region growing + steep-slope correction).
 
@@ -124,6 +127,8 @@ async def segment_trees_pycrown(
     first-return Otsu convex-hull crown smoothing with classified LAS export.
     With point-cloud input and LAS export enabled, tree_instances.las preserves source points and appends
     the height above ground and supported tree IDs. Unassigned points keep ID zero.
+    Opt-in occluded instances are recorded in the LAS and tree_summary.csv, with their parent
+    mapped crown ID. Two-dimensional counts, raster boundaries and treetop vectors retain their meaning.
     """
     try:
         for val, label_name, allow_zero in (
@@ -160,6 +165,7 @@ async def segment_trees_pycrown(
             mean_ratio=0.0,
             crown_radius_m=float(crown_radius_m),
             use_pointcloud_supplement=bool(use_pointcloud_supplement),
+            recover_occluded_crowns=recover_occluded_crowns,
         )
 
         out_dir = Path(output_path).resolve()
@@ -255,6 +261,13 @@ async def segment_trees_pycrown(
             f"平均树高 {summary_data['height_mean_m']:.2f} m（最高 {summary_data['height_max_m']:.2f} m），"
             f"平均冠幅面积 {summary_data['crown_area_mean_m2']:.2f} m²，陡坡校正 {moved_tops} 棵。"
         )
+        if (
+            recover_occluded_crowns
+            and summary_data["point_instance_export"]
+            and summary_data["point_instance_export"].get("occluded_tree_count", 0) > 0
+        ):
+            count = summary_data["point_instance_export"]["occluded_tree_count"]
+            message += f" 单木点云和单木表额外记录了 {count} 棵三维遮挡实例。"
         return {
             "status": "success",
             "output_path": str(zip_file),

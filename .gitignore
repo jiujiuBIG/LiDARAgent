@@ -4,3 +4,4 @@ __pycache__/
 .pytest_cache/
 experiments/**/.demo_data/
 mcp_llm_web/backend/data/results/
+.venv-lidar/

@@ -7,6 +7,7 @@ from app.services.mcp_service import (
     NORMALS_TOOL,
     PYCROWN_TOOL,
     RASTER_PRODUCT_TOOLS,
+    SEGMENTATION_TOOLS,
     WATERSHED_TOOL,
     mcp_service,
 )
@@ -213,7 +214,7 @@ class AgentService:
                 }
             )
 
-            if tool_name in (NORMALS_TOOL, WATERSHED_TOOL, PYCROWN_TOOL) or tool_name in RASTER_PRODUCT_TOOLS:
+            if tool_name == NORMALS_TOOL or tool_name in SEGMENTATION_TOOLS | RASTER_PRODUCT_TOOLS:
                 tool_result = await mcp_service.call_tool(
                     tool_name, message, file_context, arguments=tool_call_info.get("arguments")
                 )
@@ -222,7 +223,7 @@ class AgentService:
             normal_error = tool_name == NORMALS_TOOL and tool_result.get("status") == "error"
             watershed_error = tool_name == WATERSHED_TOOL and tool_result.get("status") == "error"
             pycrown_error = tool_name == PYCROWN_TOOL and tool_result.get("status") == "error"
-            tool_error = tool_result.get("status") == "error"
+            tool_pending = tool_result.get("status") in {"error", "needs_confirmation"}
             actual_arguments = {}
             if tool_name == NORMALS_TOOL and not normal_error:
                 normal_data = tool_result["data"]
@@ -260,7 +261,7 @@ class AgentService:
                         "法向量估计未完成" if normal_error
                         else ("分水岭分割未完成" if watershed_error
                               else ("PyCrown 分割未完成" if pycrown_error
-                                    else (f"工具 {tool_name} 未完成" if tool_error else f"✅ 工具 {tool_name} 执行完成")))
+                                    else (f"工具 {tool_name} 未完成" if tool_pending else f"✅ 工具 {tool_name} 执行完成")))
                     ),
                     "tool_calls": [tool_name],
                     "progress": 60,
@@ -283,7 +284,7 @@ class AgentService:
                 },
             ]
 
-            if tool_error:
+            if tool_pending:
                 response = {"content": message_for_llm}
             else:
                 response = await llm_service.chat_complete(messages=messages)
@@ -291,7 +292,7 @@ class AgentService:
             thoughts.append(
                 {
                     "step": "completed",
-                    "thought": message_for_llm if tool_error else "分析完成",
+                    "thought": message_for_llm if tool_pending else "分析完成",
                     "tool_calls": [tool_name],
                     "progress": 100,
                 }

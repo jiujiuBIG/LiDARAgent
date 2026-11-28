@@ -334,6 +334,11 @@ class MCPService:
             "use_pointcloud_supplement": use_pointcloud_supplement,
             "output_path": str(settings.RESULTS_DIR / uuid4().hex),
         }
+        if "recover_occluded_crowns" in arguments:
+            recover_occluded_crowns = arguments["recover_occluded_crowns"]
+            if not isinstance(recover_occluded_crowns, bool):
+                raise ValueError("recover_occluded_crowns 必须为布尔值。")
+            tool_arguments["recover_occluded_crowns"] = recover_occluded_crowns
         if point_cloud_path:
             tool_arguments["point_cloud_path"] = point_cloud_path
         return tool_arguments
@@ -357,7 +362,6 @@ class MCPService:
         chm_resolution_m = arguments.get("chm_resolution_m", 0.5)
         use_pointcloud_supplement = arguments.get("use_pointcloud_supplement", True)
         export_las = arguments.get("export_las", True)
-        recover_occluded_crowns = arguments.get("recover_occluded_crowns", False)
 
         if type(sigma_m) not in (int, float) or not 0 <= sigma_m <= float_info.max:
             raise ValueError("平滑半径 sigma_m 必须是不小于 0 的数字（米）。")
@@ -377,8 +381,6 @@ class MCPService:
             raise ValueError("use_pointcloud_supplement 必须为布尔值。")
         if not isinstance(export_las, bool):
             raise ValueError("export_las 必须为布尔值。")
-        if not isinstance(recover_occluded_crowns, bool):
-            raise ValueError("recover_occluded_crowns 必须为布尔值。")
 
         tool_arguments = {
             "file_path": primary_file,
@@ -392,8 +394,11 @@ class MCPService:
             "export_las": export_las,
             "output_path": str(settings.RESULTS_DIR / uuid4().hex),
         }
-        if recover_occluded_crowns:
-            tool_arguments["recover_occluded_crowns"] = True
+        if "recover_occluded_crowns" in arguments:
+            recover_occluded_crowns = arguments["recover_occluded_crowns"]
+            if not isinstance(recover_occluded_crowns, bool):
+                raise ValueError("recover_occluded_crowns 必须为布尔值。")
+            tool_arguments["recover_occluded_crowns"] = recover_occluded_crowns
         if dsm_file:
             tool_arguments["dsm_path"] = dsm_file
         if dtm_file:

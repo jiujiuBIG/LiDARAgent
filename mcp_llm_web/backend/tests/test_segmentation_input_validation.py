@@ -41,6 +41,20 @@ def test_chat_rejects_missing_or_duplicate_chm(tmp_path, parser_name, names):
         parse(_attachments(tmp_path, *names), {})
 
 
+@pytest.mark.parametrize("parser_name", ("parse_watershed_args", "parse_pycrown_args"))
+@pytest.mark.parametrize("flag", (False, True))
+def test_chat_forwards_explicit_occluded_crown_setting(tmp_path, parser_name, flag):
+    from app.services.mcp_service import MCPService
+
+    parse = getattr(MCPService(), parser_name)
+    files = _attachments(tmp_path, "plot.las")
+    key = "recover_occluded_crowns"
+    assert key not in parse(files, {})
+    assert parse(files, {key: flag})[key] is flag
+    with pytest.raises(ValueError, match=key):
+        parse(files, {key: "false"})
+
+
 @pytest.mark.parametrize(
     "epsg, east, expected_error",
     [

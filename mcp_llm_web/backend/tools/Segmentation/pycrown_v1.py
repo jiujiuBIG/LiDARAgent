@@ -1426,7 +1426,7 @@ def write_results(folder, grid, result, export_las=True, *, settings=Settings())
             grid._cache['instance_export'] = write_instance_cloud(
                 grid.las_path, folder / 'tree_instances.las', heights, point_ids,
                 method="crown_raster_and_verified_stems",
-                summary_path=folder / 'tree_summary.csv' if settings.recover_occluded_crowns else None,
+                summary_path=folder / 'tree_summary.csv',
                 occluded_parent_ids=occluded_parents,
             )
     return classified_points

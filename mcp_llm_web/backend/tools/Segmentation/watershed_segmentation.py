@@ -1014,7 +1014,7 @@ async def segment_trees_watershed(
                 instance_export = write_instance_cloud(
                     cloud_path, staging / "tree_instances.las", cloud[:, 2], point_ids,
                     method="crown_raster_and_verified_stems",
-                    summary_path=staging / "tree_summary.csv" if recover_occluded_crowns else None,
+                    summary_path=staging / "tree_summary.csv",
                     occluded_parent_ids=occluded_parents,
                 )
 
@@ -1022,6 +1022,7 @@ async def segment_trees_watershed(
                 "algorithm": "marker-controlled watershed + 3D stem-to-crown v9",
                 "input_type": "point_cloud" if ext in (".las", ".laz") else "chm_raster",
                 "pointcloud_supplement_used": pointcloud_used,
+                "recover_occluded_crowns": bool(recover_occluded_crowns),
                 "point_instance_export": instance_export,
                 "tree_count": len(records),
                 "chm_seed_count": chm_seed_count,

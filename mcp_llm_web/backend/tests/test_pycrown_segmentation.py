@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import json
 import zipfile
 from pathlib import Path
@@ -20,6 +21,7 @@ from app.models import database
 from app.services.llm_service import llm_service
 from app.services.mcp_service import PYCROWN_TOOL, mcp_service
 from tools.Segmentation.pycrown_segmentation import segment_trees_pycrown
+from tools.Segmentation.watershed_segmentation import segment_trees_watershed
 
 
 def _write_synthetic_las(path: Path):
@@ -88,6 +90,28 @@ def test_pycrown_tool_segments_synthetic_las_and_packs_outputs(tmp_path):
     }.issubset(names)
     with laspy.open(out_dir / "trees.las") as output:
         assert output.header.parse_crs().to_epsg() == 25832
+
+
+@pytest.mark.parametrize("segment", (segment_trees_pycrown, segment_trees_watershed))
+@pytest.mark.parametrize("flag", (None, False, True))
+def test_occluded_recovery_switch_keeps_the_instance_summary(tmp_path, segment, flag):
+    source = tmp_path / "plot.las"
+    _write_synthetic_las(source)
+    kwargs = {} if flag is None else {"recover_occluded_crowns": flag}
+    result = asyncio.run(segment(str(source), output_path=str(tmp_path / "result"), **kwargs))
+
+    assert result["status"] == "success", result
+    data = result["data"]
+    assert data.get("settings", data).get("recover_occluded_crowns") is (flag is not False)
+    instance = data["point_instance_export"]
+    assert instance["summary_filename"] == "tree_summary.csv"
+    assert instance["occluded_tree_count"] == 0
+    with zipfile.ZipFile(result["output_path"]) as archive:
+        rows = list(csv.DictReader(archive.read("tree_summary.csv").decode("utf-8").splitlines()))
+        assert instance["filename"] in archive.namelist()
+    assert len(rows) == instance["labelled_trees"] == 2
+    assert sum(int(row["point_count"]) for row in rows) == instance["labelled_points"]
+    assert all(not row["parent_2d_crown_id"] for row in rows)
 
 
 @pytest.mark.skipif(

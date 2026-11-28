@@ -11,10 +11,13 @@ from app.core.config import settings
 from app.models.database import MessageModel, db_service
 from app.services.agent_service import agent_service
 from app.services.mcp_service import (
+    AUTO_SEGMENTATION_TOOL,
+    DEEP_SEGMENTATION_TOOLS,
     FOREST_PARAMETER_TOOLS,
     NORMALS_TOOL,
     PYCROWN_TOOL,
     RASTER_PRODUCT_TOOLS,
+    SEGMENTATION_TOOLS,
     WATERSHED_TOOL,
 )
 
@@ -74,6 +77,7 @@ def downloadable_tool_result(
         NORMALS_TOOL: (".las",),
         WATERSHED_TOOL: (".zip", ".tif", ".geojson", ".shp"),
         PYCROWN_TOOL: (".zip", ".tif", ".gpkg", ".las"),
+        **{name: (".zip",) for name in DEEP_SEGMENTATION_TOOLS | {AUTO_SEGMENTATION_TOOL}},
         **{name: (".csv",) for name in FOREST_PARAMETER_TOOLS},
         **{name: (".tif",) for name in RASTER_PRODUCT_TOOLS},
     }
@@ -117,7 +121,7 @@ def reusable_result_file(message: Optional[MessageModel]) -> Optional[tuple[Path
         return normal_file, "point_cloud"
 
     legacy_crown = None
-    for tool in (PYCROWN_TOOL, WATERSHED_TOOL):
+    for tool in (PYCROWN_TOOL, WATERSHED_TOOL, *sorted(DEEP_SEGMENTATION_TOOLS), AUTO_SEGMENTATION_TOOL):
         result = downloadable_tool_result(message, tool)
         if result is None:
             continue
@@ -128,7 +132,26 @@ def reusable_result_file(message: Optional[MessageModel]) -> Optional[tuple[Path
             continue
 
         data = tool_result.get("data")
-        records_instance_export = isinstance(data, dict) and "point_instance_export" in data
+        if not isinstance(data, dict):
+            data = {}
+        engine = tool
+        if tool == AUTO_SEGMENTATION_TOOL:
+            routing = data.get("routing")
+            engine = routing.get("selected_tool") if isinstance(routing, dict) else None
+        if not isinstance(engine, str):
+            continue
+        if engine in DEEP_SEGMENTATION_TOOLS:
+            exported_cloud = data.get("segmented_cloud")
+            if isinstance(exported_cloud, str):
+                exported_path = Path(exported_cloud)
+                if exported_path.suffix.lower() in (".las", ".laz"):
+                    instance = sibling_result_file(path, exported_path.name)
+                    if instance is not None:
+                        return instance, "tree_instances"
+            continue
+        if engine not in (PYCROWN_TOOL, WATERSHED_TOOL):
+            continue
+        records_instance_export = "point_instance_export" in data
         if records_instance_export and data["point_instance_export"] is None:
             continue
         instance = sibling_result_file(path, "tree_instances.las")
@@ -228,7 +251,7 @@ async def send_message(request: ChatRequest, http_request: Request):
 
     downloadable_tool_used = any(
         entry.get("tool") in (
-            {NORMALS_TOOL, WATERSHED_TOOL, PYCROWN_TOOL} | FOREST_PARAMETER_TOOLS | RASTER_PRODUCT_TOOLS
+            {NORMALS_TOOL} | SEGMENTATION_TOOLS | FOREST_PARAMETER_TOOLS | RASTER_PRODUCT_TOOLS
         )
         for entry in result.get("tool_results", [])
     )

@@ -12,7 +12,11 @@ from app.api.chat import chat_router, reusable_result_file
 from app.core.config import settings
 from app.models import database
 from app.services.agent_service import agent_service
-from app.services.mcp_service import NORMALS_TOOL, PYCROWN_TOOL, WATERSHED_TOOL, mcp_service
+from app.services.llm_service import llm_service
+from app.services.mcp_service import (
+    AUTO_SEGMENTATION_TOOL, NORMALS_TOOL, PYCROWN_TOOL, SEGMENTANYTREE_TOOL,
+    TREELEARN_TOOL, WATERSHED_TOOL, mcp_service,
+)
 
 
 @pytest.fixture
@@ -112,6 +116,55 @@ def test_forest_instances_are_reusable_in_response_and_history(client, result_di
     stored_result = client.get(session_url).json()["messages"][1]
     assert stored_result["reusable_result"] is None
     assert stored_result["download_url"] == body["download_url"]
+
+
+@pytest.mark.parametrize("tool, arguments, filename", [
+    (TREELEARN_TOOL, {"weight_variant": "small", "tau_min": 60}, "plot_treelearn.las"),
+    (SEGMENTANYTREE_TOOL, {"voxel_dedup_m": 0.05}, "plot_segmentanytree.las"),
+    (AUTO_SEGMENTATION_TOOL, {"preference": "fast"}, "tree_instances.las"),
+    (AUTO_SEGMENTATION_TOOL, {"preference": "treelearn"}, "plot_treelearn.las"),
+])
+def test_new_segmentation_web_routes_forward_arguments_and_publish_results(
+    client, result_dir, monkeypatch, tool, arguments, filename,
+):
+    cloud_path = result_dir / filename
+    cloud_path.touch()
+    archive_path = result_dir / "segment.zip"
+    with ZipFile(archive_path, "w") as archive:
+        archive.write(cloud_path, filename)
+    selected = PYCROWN_TOOL if filename == "tree_instances.las" else TREELEARN_TOOL
+    data = (
+        {"point_instance_export": {"filename": filename}}
+        if filename == "tree_instances.las"
+        else {"segmented_cloud": str(cloud_path)}
+    )
+    if tool == AUTO_SEGMENTATION_TOOL:
+        data["routing"] = {"selected_tool": selected}
+    result = make_result(archive_path, data=data)
+
+    async def completion(messages):
+        if messages[0]["content"].startswith("You are a router"):
+            return {"content": json.dumps({"tool_name": tool, "arguments": {
+                **arguments, "file_path": "/untrusted.las",
+            }})}
+        return {"content": "segmented"}
+
+    async def call_tool(name, query, file_context, arguments=None):
+        assert name == tool
+        assert arguments == expected_arguments
+        return result
+
+    expected_arguments = arguments
+    monkeypatch.setattr(llm_service, "chat_complete", completion)
+    monkeypatch.setattr(mcp_service, "all_tools", {tool: {}})
+    monkeypatch.setattr(mcp_service, "call_tool", call_tool)
+    response = client.post(f"{settings.API_V1_PREFIX}/chat/send", json={"message": "segment trees"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["tool_data"] == data
+    assert body["reusable_result"]["filename"] == filename
+    assert body["reusable_result"]["kind"] == "tree_instances"
+    assert client.get(body["download_url"]).content == archive_path.read_bytes()
 
 
 @pytest.mark.parametrize("direct", [False, True])

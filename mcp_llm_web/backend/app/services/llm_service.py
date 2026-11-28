@@ -1,6 +1,9 @@
 from openai import AsyncOpenAI
 from app.core.config import settings
-from app.services.mcp_service import NORMALS_TOOL, PYCROWN_TOOL, RASTER_PRODUCT_TOOLS, WATERSHED_TOOL
+from app.services.mcp_service import (
+    AUTO_SEGMENTATION_TOOL, DEEP_SEGMENTATION_TOOLS, NORMALS_TOOL, PYCROWN_TOOL,
+    RASTER_PRODUCT_TOOLS, SEGMENTATION_TOOLS, WATERSHED_TOOL,
+)
 from typing import AsyncIterator, Dict, Any, Optional, List
 import json
 import re
@@ -122,7 +125,9 @@ class LLMService:
                 "and include an arguments object with any explicitly stated numerical parameters: "
                 "sigma_m (Gaussian smoothing sigma in metres, default 0.35), min_distance_m (minimum treetop "
                 "spacing in metres, default 0.75), min_canopy_height_m (minimum canopy height in metres, default 2.0), "
-                "chm_resolution_m (CHM resolution in metres, default 0.5), and use_pointcloud_supplement (boolean, default true)."
+                "chm_resolution_m (CHM resolution in metres, default 0.5), use_pointcloud_supplement (boolean, default true), "
+                "and recover_occluded_crowns (boolean, default true; set to false when the user explicitly disables "
+                "occluded lower-crown recovery/splitting)."
             )
         pycrown_instructions = ""
         if PYCROWN_TOOL in tool_names:
@@ -134,7 +139,22 @@ class LLMService:
                 "spacing in metres, default 0.75), min_height_m (minimum treetop height in metres, default 4.0), "
                 "min_canopy_height_m (minimum canopy height in metres, default 2.0), crown_radius_m (maximum crown "
                 "growth radius in metres, default 6.0), chm_resolution_m (CHM resolution in metres, default 0.5), "
-                "use_pointcloud_supplement (boolean, default true), and export_las (boolean, default true)."
+                "use_pointcloud_supplement (boolean, default true), export_las (boolean, default true), "
+                "and recover_occluded_crowns (boolean, default true; set to false when the user explicitly disables "
+                "occluded lower-crown recovery/splitting)."
+            )
+        segmentation_instructions = ""
+        if AUTO_SEGMENTATION_TOOL in tool_names:
+            segmentation_instructions += (
+                " For individual-tree segmentation without a named algorithm, select auto_segment_trees. "
+                "Use preference 'fast' for a quick preview or 'high_purity' for that explicit preference. "
+                "Set include_small_trees only on request. Set allow_large_cloud to true only when "
+                "the most recent user message explicitly confirms 0.05 m voxel deduplication for the selected input."
+            )
+        if DEEP_SEGMENTATION_TOOLS & tool_names:
+            segmentation_instructions += (
+                " For explicit TreeLearn or SegmentAnyTree requests, select the corresponding tool and "
+                "include arguments explicitly stated by the user and listed in its inputSchema."
             )
         router_messages = [
             {
@@ -147,6 +167,7 @@ class LLMService:
                     + normals_instructions
                     + watershed_instructions
                     + pycrown_instructions
+                    + segmentation_instructions
                 ),
             },
             {
@@ -187,7 +208,7 @@ class LLMService:
                 "tool_name": tool_name,
                 "reason": data.get("reason", ""),
             }
-            if tool_name in (NORMALS_TOOL, WATERSHED_TOOL, PYCROWN_TOOL) or tool_name in RASTER_PRODUCT_TOOLS:
+            if tool_name == NORMALS_TOOL or tool_name in SEGMENTATION_TOOLS | RASTER_PRODUCT_TOOLS:
                 arguments = data.get("arguments")
                 if isinstance(arguments, dict):
                     arguments = {

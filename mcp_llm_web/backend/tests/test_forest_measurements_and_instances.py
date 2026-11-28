@@ -114,6 +114,62 @@ def test_dbh_interpolates_at_breast_height_with_two_sided_tilted_stem_evidence(t
     assert rows.loc[3, "measurement_status"] == "no_breast_height_points"
 
 
+def test_dbh_filters_distant_neighbor_stem_points_via_primary_cluster(tmp_path, monkeypatch):
+    tool = load_measurement("3.DHB.py")
+    angles = np.linspace(0, 2 * np.pi, 32, endpoint=False)
+    main_x = 0.14 * np.cos(angles)
+    main_y = 0.14 * np.sin(angles)
+    # Contaminate the same instance with a nearby neighbor trunk 1.6 m away
+    nbr_angles = np.linspace(0, 2 * np.pi, 18, endpoint=False)
+    nbr_x = 1.6 + 0.10 * np.cos(nbr_angles)
+    nbr_y = 0.10 * np.sin(nbr_angles)
+    frame = pd.DataFrame({
+        "x": np.r_[main_x, nbr_x],
+        "y": np.r_[main_y, nbr_y],
+        "z": 101.3,
+        "treeid": 1,
+        "heightaboveground": 1.3,
+    })
+    monkeypatch.setattr(tool, "read_point_cloud", lambda *args, **kwargs: frame)
+    result = asyncio.run(tool.extract_forest_dbh("test.las", str(tmp_path)))
+    assert result["status"] == "success", result
+    row = pd.read_csv(result["output_path"]).iloc[0]
+    assert row["measurement_status"] == "measured"
+    assert row["DBH"] == pytest.approx(0.28, abs=0.02)
+
+
+def test_dbh_rejects_oversized_short_arc_section_and_falls_back_to_cylinder(tmp_path, monkeypatch):
+    tool = load_measurement("3.DHB.py")
+    # Build a 0.15 m radius cylinder across 0.9-1.7 m, but place a shallow 95-deg
+    # arc of radius 0.35 m at 1.3 m that would extrapolate an oversized circle.
+    heights_side = np.repeat([0.9, 1.05, 1.55, 1.7], 20)
+    angles_side = np.tile(np.linspace(0, 2 * np.pi, 20, endpoint=False), 4)
+    side_x = 0.15 * np.cos(angles_side)
+    side_y = 0.15 * np.sin(angles_side)
+
+    arc_angles = np.linspace(-0.82, 0.82, 22)  # ~94 deg arc
+    arc_x = -0.20 + 0.35 * np.cos(arc_angles)
+    arc_y = 0.35 * np.sin(arc_angles)
+
+    # Confirm the short-arc section itself is rejected as oversized
+    assert tool.fit_stem_section(np.column_stack((arc_x, arc_y))) is None
+
+    frame = pd.DataFrame({
+        "x": np.r_[side_x, arc_x],
+        "y": np.r_[side_y, arc_y],
+        "z": 100.0 + np.r_[heights_side, np.full(len(arc_x), 1.3)],
+        "treeid": 1,
+        "heightaboveground": np.r_[heights_side, np.full(len(arc_x), 1.3)],
+    })
+    monkeypatch.setattr(tool, "read_point_cloud", lambda *args, **kwargs: frame)
+    result = asyncio.run(tool.extract_forest_dbh("test.las", str(tmp_path)))
+    assert result["status"] == "success", result
+    row = pd.read_csv(result["output_path"]).iloc[0]
+    assert row["measurement_status"] == "measured"
+    assert row["fit_method"] == "bracketed_stem_cylinder"
+    assert row["DBH"] == pytest.approx(0.30, abs=0.03)
+
+
 def test_crown_threshold_and_fit_share_the_same_points(tmp_path, monkeypatch):
     tool = load_measurement("2.TreeCrown.py")
     z = np.arange(5000, dtype=np.float64)
@@ -167,6 +223,26 @@ def test_crown_exports_full_sorted_axes_in_projected_coordinates(tmp_path, monke
     fit = tool.calculate_crown_ellipse_dimensions(np.column_stack((x, y, z)))
     assert fit["convex_hull_area"] == pytest.approx(np.pi * 4 * 2.5, rel=0.001)
     assert fit["orientation"] == pytest.approx(rotation, abs=0.01)
+
+
+def test_crown_denoise_drops_distant_stray_points_without_open3d(monkeypatch):
+    tool = load_measurement("2.TreeCrown.py")
+    monkeypatch.setattr(tool, "o3d", None)
+    rng = np.random.default_rng(42)
+    main_crown = np.column_stack((
+        rng.uniform(-2.0, 2.0, 400),
+        rng.uniform(-1.5, 1.5, 400),
+        rng.uniform(10.0, 20.0, 400),
+    ))
+    stray = np.column_stack((
+        rng.uniform(25.0, 26.0, 30),
+        rng.uniform(25.0, 26.0, 30),
+        rng.uniform(12.0, 15.0, 30),
+    ))
+    cleaned = tool.denoise_point_cloud(np.vstack((main_crown, stray)))
+    assert len(cleaned) >= 350
+    assert float(np.max(cleaned[:, 0])) < 5.0
+    assert float(np.max(cleaned[:, 1])) < 5.0
 
 
 def test_instance_trace_preserves_points_and_leaves_ambiguous_unassigned(tmp_path):

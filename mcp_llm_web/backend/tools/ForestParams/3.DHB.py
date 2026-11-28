@@ -17,6 +17,8 @@ from tools.Segmentation.point_instances import BREAST_HEIGHT_MAX, BREAST_HEIGHT_
 from tools.Preprocessing.utils import clean_point_cloud
 from tools.Preprocessing.write import dataframe_to_las
 from scipy.optimize import least_squares
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial import cKDTree
 
 
 def has_treeid(file_path: str) -> bool:
@@ -201,6 +203,31 @@ STEM_BAND_HALF_HEIGHT_M = 0.5
 STEM_BAND_INLIER_TOLERANCE_M = 0.04
 MIN_STEM_SIDE_POINTS = 8
 MAX_STEM_EVIDENCE_GAP_M = 0.55
+STEM_CLUSTER_RADIUS_M = 0.40
+
+
+def extract_primary_stem_cluster(xy: np.ndarray, radius_m: float = STEM_CLUSTER_RADIUS_M) -> np.ndarray:
+    """Return a boolean mask selecting the largest XY connected component."""
+    n = len(xy)
+    if n <= 1:
+        return np.ones(n, dtype=bool)
+    tree = cKDTree(xy)
+    graph = tree.sparse_distance_matrix(tree, max_distance=radius_m, output_type="coo_matrix")
+    n_comp, labels = connected_components(graph, directed=False)
+    if n_comp <= 1:
+        return np.ones(n, dtype=bool)
+    largest = int(np.bincount(labels).argmax())
+    return labels == largest
+
+
+def _approx_xy_span(xy: np.ndarray) -> float:
+    """Approximate maximum pairwise XY span in O(N) using 8 directional projections."""
+    if len(xy) < 2:
+        return 0.0
+    angles = np.linspace(0.0, np.pi, 8, endpoint=False)
+    dirs = np.column_stack((np.cos(angles), np.sin(angles)))
+    proj = xy @ dirs.T
+    return float(np.max(proj.max(axis=0) - proj.min(axis=0)))
 
 
 def fit_stem_section(xy: np.ndarray):
@@ -256,6 +283,10 @@ def fit_stem_section(xy: np.ndarray):
     arc = 2 * np.pi - np.diff(np.r_[angles, angles[0] + 2 * np.pi]).max()
     if arc < np.pi / 2:
         return None
+    # Reject extrapolated oversized circles fitted to short partial arcs.
+    span = _approx_xy_span(points[support])
+    if arc < np.pi and span > 0 and (2.0 * fit.x[2]) > 1.35 * span:
+        return None
 
     _, _, _, score, _ = fit_circle_least_squares(points[support])
     return {
@@ -277,7 +308,11 @@ def fit_dbh_sections(xyz, treeid):
     for tree_id, start, stop in zip(ids, starts, np.r_[starts[1:], len(order)]):
         if tree_id <= 0 or stop - start < MIN_DBH_POINTS:
             continue
-        circle = fit_stem_section(xy[order[start:stop]])
+        section_xy = xy[order[start:stop]]
+        cluster = extract_primary_stem_cluster(section_xy)
+        if np.count_nonzero(cluster) < MIN_DBH_POINTS:
+            continue
+        circle = fit_stem_section(section_xy[cluster])
         if circle is not None:
             results.append({"treeid": tree_id, **circle})
     return pd.DataFrame(results)
@@ -285,6 +320,9 @@ def fit_dbh_sections(xyz, treeid):
 
 def fit_bracketed_stem(xyz: np.ndarray):
     """Estimate a local cylinder through the reference breast height."""
+    cluster = extract_primary_stem_cluster(xyz[:, :2])
+    if np.count_nonzero(cluster) >= 2 * MIN_STEM_SIDE_POINTS:
+        xyz = xyz[cluster]
     below = xyz[:, 2] < BREAST_HEIGHT_MIN
     above = xyz[:, 2] > BREAST_HEIGHT_MAX
     if min(np.count_nonzero(below), np.count_nonzero(above)) < MIN_STEM_SIDE_POINTS:
@@ -322,12 +360,13 @@ def fit_bracketed_stem(xyz: np.ndarray):
             continue
 
         errors = radial_error(fit.x)
-        support = np.abs(errors) <= tolerance
+        eff_tol = float(min(0.055, max(tolerance, 0.22 * fit.x[2])))
+        support = np.abs(errors) <= eff_tol
         count = int(np.count_nonzero(support))
         lower_support, upper_support = support & below, support & above
         supported_sides = min(np.count_nonzero(lower_support), np.count_nonzero(upper_support))
         side_residual = max(np.median(np.abs(errors[group])) for group in (below, above))
-        if count < 0.55 * len(xyz) or supported_sides < MIN_STEM_SIDE_POINTS or side_residual > tolerance:
+        if supported_sides < MIN_STEM_SIDE_POINTS:
             continue
         if height[upper_support].min() - height[lower_support].max() > MAX_STEM_EVIDENCE_GAP_M:
             continue
@@ -335,6 +374,11 @@ def fit_bracketed_stem(xyz: np.ndarray):
         angles = np.sort(np.arctan2(unleaned[:, 1], unleaned[:, 0]))
         arc = 2 * np.pi - np.diff(np.r_[angles, angles[0] + 2 * np.pi]).max()
         if arc < np.pi / 2:
+            continue
+        strong_wrap = count >= 60 and supported_sides >= 2 * MIN_STEM_SIDE_POINTS and arc >= np.pi
+        min_inlier_ratio = 0.45 if strong_wrap else 0.55
+        max_side_residual = eff_tol * 1.25 if strong_wrap else eff_tol
+        if count < min_inlier_ratio * len(xyz) or side_residual > max_side_residual:
             continue
         rmse = float(np.sqrt(np.mean(errors[support] ** 2)))
         score = float(np.minimum(np.abs(errors), tolerance).mean())

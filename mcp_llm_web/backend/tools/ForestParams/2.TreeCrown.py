@@ -14,10 +14,15 @@ import laspy
 from mcp.server.fastmcp import FastMCP
 from tools.Preprocessing.read import read_point_cloud
 from tools.Preprocessing.utils import clean_point_cloud, get_xyz_array
-import open3d as o3d
-from scipy.spatial import ConvexHull, QhullError
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial import ConvexHull, QhullError, cKDTree
 from tqdm import tqdm
 import cv2
+
+try:
+    import open3d as o3d
+except ImportError:
+    o3d = None
 
 
 def has_treeid(file_path: str) -> bool:
@@ -131,18 +136,53 @@ def run_tree_segmentation(file_path: str, output_path: str) -> str:
     return output_las
 
 
+def _keep_primary_xy_cluster(points_array: np.ndarray, radius_m: float = 1.5) -> np.ndarray:
+    """Keep the XY connected component with the most points (grid-accelerated)."""
+    if len(points_array) <= 1:
+        return points_array
+    xy = np.asarray(points_array[:, :2], dtype=np.float64)
+    cell_size = max(0.25, radius_m * 0.5)
+    origin = xy.min(axis=0)
+    cell_ij = np.floor((xy - origin) / cell_size).astype(np.int64)
+    unique_cells, inverse, cell_counts = np.unique(
+        cell_ij, axis=0, return_inverse=True, return_counts=True
+    )
+    if len(unique_cells) <= 1:
+        return points_array
+    cell_centers = origin + (unique_cells + 0.5) * cell_size
+    tree = cKDTree(cell_centers)
+    graph = tree.sparse_distance_matrix(tree, max_distance=radius_m, output_type="coo_matrix")
+    n_comp, comp_labels = connected_components(graph, directed=False)
+    if n_comp <= 1:
+        return points_array
+    comp_weights = np.bincount(comp_labels, weights=cell_counts)
+    best_comp = int(comp_weights.argmax())
+    return points_array[comp_labels[inverse] == best_comp]
+
+
 def denoise_point_cloud(
-    points_array: np.ndarray, nb_neighbors: int = 20, std_ratio: float = 2.0
+    points_array: np.ndarray,
+    nb_neighbors: int = 20,
+    std_ratio: float = 2.0,
+    cluster_radius_m: float = 1.5,
 ) -> np.ndarray:
     if len(points_array) < nb_neighbors:
         return points_array
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points_array)
-    cl, ind = pcd.remove_statistical_outlier(
-        nb_neighbors=nb_neighbors, std_ratio=std_ratio
-    )
-    denoised_points = np.asarray(cl.points)
-    return denoised_points
+    if o3d is not None:
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points_array)
+        cl, _ = pcd.remove_statistical_outlier(
+            nb_neighbors=nb_neighbors, std_ratio=std_ratio
+        )
+        denoised_points = np.asarray(cl.points)
+    else:
+        pts = np.asarray(points_array, dtype=np.float64)
+        k = min(nb_neighbors + 1, len(pts))
+        dists, _ = cKDTree(pts).query(pts, k=k)
+        mean_d = dists[:, 1:].mean(axis=1)
+        threshold = float(mean_d.mean() + std_ratio * mean_d.std())
+        denoised_points = pts[mean_d <= threshold]
+    return _keep_primary_xy_cluster(denoised_points, radius_m=cluster_radius_m)
 
 
 def calculate_crown_ellipse_dimensions(points_3d: np.ndarray) -> dict:

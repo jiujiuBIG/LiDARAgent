@@ -4,7 +4,7 @@ import os
 import re
 from contextlib import AsyncExitStack
 from pathlib import Path
-from sys import float_info
+from sys import executable, float_info
 from typing import Optional, Dict, Any, List
 from uuid import uuid4
 from mcp import ClientSession, StdioServerParameters
@@ -14,6 +14,11 @@ from app.core.config import settings
 NORMALS_TOOL = "estimate_point_cloud_normals"
 WATERSHED_TOOL = "segment_trees_watershed"
 PYCROWN_TOOL = "segment_trees_pycrown"
+SEGMENTANYTREE_TOOL = "segment_trees_segmentanytree"
+TREELEARN_TOOL = "segment_trees_treelearn"
+AUTO_SEGMENTATION_TOOL = "auto_segment_trees"
+DEEP_SEGMENTATION_TOOLS = frozenset({SEGMENTANYTREE_TOOL, TREELEARN_TOOL})
+SEGMENTATION_TOOLS = DEEP_SEGMENTATION_TOOLS | {WATERSHED_TOOL, PYCROWN_TOOL, AUTO_SEGMENTATION_TOOL}
 FOREST_PARAMETER_TOOLS = frozenset(
     {"extract_tree_height", "extract_tree_crown", "extract_forest_dbh"}
 )
@@ -67,22 +72,22 @@ class MCPService:
             raise ValueError("服务器脚本必须是 Python (.py) 文件")
 
         server_params = StdioServerParameters(
-            command="python",
+            command=executable,
             args=[server_script_path],
             env={
                 **os.environ,
-                "PYTHONPATH": str(settings.BASE_DIR),
+                "PYTHONPATH": os.pathsep.join(
+                    filter(None, (str(settings.BASE_DIR), os.environ.get("PYTHONPATH")))
+                ),
             },
         )
 
-        stdio_transport = await self.exit_stack.enter_async_context(
-            stdio_client(server_params)
-        )
-        stdio, write = stdio_transport
-        session = await self.exit_stack.enter_async_context(ClientSession(stdio, write))
-        await session.initialize()
-
-        response = await session.list_tools()
+        async with AsyncExitStack() as connection:
+            stdio, write = await connection.enter_async_context(stdio_client(server_params))
+            session = await connection.enter_async_context(ClientSession(stdio, write))
+            await session.initialize()
+            response = await session.list_tools()
+            self.exit_stack.push_async_callback(connection.pop_all().aclose)
         for tool in response.tools:
             self.all_tools[tool.name] = {
                 "session": session,
@@ -94,31 +99,23 @@ class MCPService:
         self.sessions.append(session)
 
     async def connect_all_tools(self):
-        base_dir = settings.BASE_DIR
-        
-        await self.connect_to_server(f"{base_dir}/tools/ForestParams/1.TreeHight.py")
-        await self.connect_to_server(f"{base_dir}/tools/ForestParams/2.TreeCrown.py")
-        await self.connect_to_server(f"{base_dir}/tools/ForestParams/3.DHB.py")
-        await self.connect_to_server(f"{base_dir}/tools/ForestParams/4.GapFraction.py")
-        await self.connect_to_server(f"{base_dir}/tools/ForestParams/5.TopRugosity.py")
-        await self.connect_to_server(f"{base_dir}/tools/ForestParams/6.RumpleIndex.py")
-        await self.connect_to_server(f"{base_dir}/tools/ForestParams/7.GiniCoeff.py")
-        await self.connect_to_server(f"{base_dir}/tools/ForestParams/8.LAI.py")
-        await self.connect_to_server(f"{base_dir}/tools/ForestParams/9.FHD.py")
-        await self.connect_to_server(f"{base_dir}/tools/ForestParams/10.Filling.py")
-
-        await self.connect_to_server(f"{base_dir}/tools/Preprocessing/normalization.py")
-        await self.connect_to_server(f"{base_dir}/tools/Preprocessing/ground.py")
-        await self.connect_to_server(f"{base_dir}/tools/Preprocessing/filter.py")
-        await self.connect_to_server(f"{base_dir}/tools/Preprocessing/clip.py")
-        await self.connect_to_server(f"{base_dir}/tools/Preprocessing/convert.py")
-        await self.connect_to_server(f"{base_dir}/tools/Preprocessing/downsample.py")
-        await self.connect_to_server(f"{base_dir}/tools/Product/dsm.py")
-        await self.connect_to_server(f"{base_dir}/tools/Product/dtm.py")
-        await self.connect_to_server(f"{base_dir}/tools/Product/chm.py")
-        await self.connect_to_server(f"{base_dir}/tools/Preprocessing/estimate_normals.py")
-        await self.connect_to_server(f"{base_dir}/tools/Segmentation/watershed_segmentation.py")
-        await self.connect_to_server(f"{base_dir}/tools/Segmentation/pycrown_segmentation.py")
+        scripts = (
+            "ForestParams/1.TreeHight.py", "ForestParams/2.TreeCrown.py", "ForestParams/3.DHB.py",
+            "ForestParams/4.GapFraction.py", "ForestParams/5.TopRugosity.py",
+            "ForestParams/6.RumpleIndex.py", "ForestParams/7.GiniCoeff.py", "ForestParams/8.LAI.py",
+            "ForestParams/9.FHD.py", "ForestParams/10.Filling.py",
+            "Preprocessing/normalization.py", "Preprocessing/ground.py",
+            "Preprocessing/filter.py", "Preprocessing/clip.py", "Preprocessing/convert.py",
+            "Preprocessing/downsample.py", "Product/dsm.py", "Product/dtm.py", "Product/chm.py",
+            "Preprocessing/estimate_normals.py", "Segmentation/watershed_segmentation.py",
+            "Segmentation/pycrown_segmentation.py", "Segmentation/segmentanytree_segmentation.py",
+            "Segmentation/treelearn_segmentation.py", "Segmentation/auto_segmentation.py",
+        )
+        for script in scripts:
+            try:
+                await self.connect_to_server(str(settings.MCP_TOOLS_DIR / script))
+            except Exception as exc:
+                print(f"⚠️ MCP 工具未加载 {script}: {exc}")
         print(f"📦 共加载 {len(self.all_tools)} 个工具")
 
     def detect_tool_call(self, text: str) -> Optional[Dict[str, Any]]:
@@ -169,6 +166,12 @@ class MCPService:
                 args = self.parse_watershed_args(file_context, arguments)
             elif tool_name == PYCROWN_TOOL:
                 args = self.parse_pycrown_args(file_context, arguments)
+            elif tool_name == SEGMENTANYTREE_TOOL:
+                args = self.parse_segmentanytree_args(file_context, arguments)
+            elif tool_name == TREELEARN_TOOL:
+                args = self.parse_treelearn_args(file_context, arguments)
+            elif tool_name == AUTO_SEGMENTATION_TOOL:
+                args = self.parse_auto_segmentation_args(file_context, arguments)
             elif tool_name in RASTER_PRODUCT_TOOLS:
                 args = self.parse_raster_product_args(tool_name, file_context, arguments)
             else:
@@ -183,9 +186,21 @@ class MCPService:
             if getattr(result, "isError", False):
                 raise ValueError(raw_result)
 
-            if tool_name in (NORMALS_TOOL, WATERSHED_TOOL, PYCROWN_TOOL):
+            if tool_name in (
+                NORMALS_TOOL,
+                WATERSHED_TOOL,
+                PYCROWN_TOOL,
+                SEGMENTANYTREE_TOOL,
+                TREELEARN_TOOL,
+                AUTO_SEGMENTATION_TOOL,
+            ):
                 parsed = json.loads(raw_result)
-                if not isinstance(parsed, dict) or parsed.get("status") not in ("success", "error"):
+                allowed_statuses = (
+                    ("success", "error", "needs_confirmation")
+                    if tool_name == AUTO_SEGMENTATION_TOOL
+                    else ("success", "error")
+                )
+                if not isinstance(parsed, dict) or parsed.get("status") not in allowed_statuses:
                     raise ValueError("工具返回了无法解析的结果。")
                 return parsed
 
@@ -342,6 +357,7 @@ class MCPService:
         chm_resolution_m = arguments.get("chm_resolution_m", 0.5)
         use_pointcloud_supplement = arguments.get("use_pointcloud_supplement", True)
         export_las = arguments.get("export_las", True)
+        recover_occluded_crowns = arguments.get("recover_occluded_crowns", False)
 
         if type(sigma_m) not in (int, float) or not 0 <= sigma_m <= float_info.max:
             raise ValueError("平滑半径 sigma_m 必须是不小于 0 的数字（米）。")
@@ -361,6 +377,8 @@ class MCPService:
             raise ValueError("use_pointcloud_supplement 必须为布尔值。")
         if not isinstance(export_las, bool):
             raise ValueError("export_las 必须为布尔值。")
+        if not isinstance(recover_occluded_crowns, bool):
+            raise ValueError("recover_occluded_crowns 必须为布尔值。")
 
         tool_arguments = {
             "file_path": primary_file,
@@ -374,6 +392,8 @@ class MCPService:
             "export_las": export_las,
             "output_path": str(settings.RESULTS_DIR / uuid4().hex),
         }
+        if recover_occluded_crowns:
+            tool_arguments["recover_occluded_crowns"] = True
         if dsm_file:
             tool_arguments["dsm_path"] = dsm_file
         if dtm_file:
@@ -381,6 +401,88 @@ class MCPService:
         if point_cloud_path:
             tool_arguments["point_cloud_path"] = point_cloud_path
         return tool_arguments
+
+    def parse_segmentanytree_args(self, file_context: Optional[list], arguments: Optional[dict]) -> dict:
+        if len(file_context or []) != 1:
+            raise ValueError("请为 SegmentAnyTree 单木分割选择一份 LAS 或 LAZ 点云文件。")
+        file_path = file_context[0].get("file_path") or ""
+        if Path(file_path).suffix.lower() not in (".las", ".laz") or not os.path.isfile(file_path):
+            raise ValueError("选中的 LAS 或 LAZ 文件不可用，请重新上传或选择。")
+
+        arguments = arguments if isinstance(arguments, dict) else {}
+        min_instance_points = arguments.get("min_instance_points", 0)
+        voxel_dedup_m = arguments.get("voxel_dedup_m", 0.0)
+        if type(min_instance_points) is not int or min_instance_points < 0:
+            raise ValueError("min_instance_points 必须是不小于 0 的整数。")
+        if type(voxel_dedup_m) not in (int, float) or not 0 <= voxel_dedup_m <= float_info.max:
+            raise ValueError("voxel_dedup_m 必须是不小于 0 的有限数字（米）。")
+
+        return {
+            "file_path": file_path,
+            "min_instance_points": int(min_instance_points),
+            "voxel_dedup_m": float(voxel_dedup_m),
+            "output_path": str(settings.RESULTS_DIR / uuid4().hex),
+        }
+
+    def parse_treelearn_args(self, file_context: Optional[list], arguments: Optional[dict]) -> dict:
+        if len(file_context or []) != 1:
+            raise ValueError("请为 TreeLearn 单木分割选择一份 LAS 或 LAZ 点云文件。")
+        file_path = file_context[0].get("file_path") or ""
+        if Path(file_path).suffix.lower() not in (".las", ".laz") or not os.path.isfile(file_path):
+            raise ValueError("选中的 LAS 或 LAZ 点云文件不可用，请重新上传或选择。")
+
+        arguments = arguments if isinstance(arguments, dict) else {}
+        weight_variant = arguments.get("weight_variant", "default")
+        tau_min = arguments.get("tau_min", 75)
+        min_instance_points = arguments.get("min_instance_points", 0)
+        voxel_dedup_m = arguments.get("voxel_dedup_m", 0.0)
+
+        if weight_variant not in ("default", "small"):
+            raise ValueError("weight_variant 必须为 'default' 或 'small'。")
+        if type(tau_min) is not int or tau_min < 2:
+            raise ValueError("tau_min 必须是不小于 2 的整数。")
+        if type(min_instance_points) is not int or min_instance_points < 0:
+            raise ValueError("min_instance_points 必须是不小于 0 的整数。")
+        if type(voxel_dedup_m) not in (int, float) or not 0 <= voxel_dedup_m <= float_info.max:
+            raise ValueError("voxel_dedup_m 必须是不小于 0 的有限数字（米）。")
+
+        return {
+            "file_path": file_path,
+            "weight_variant": weight_variant,
+            "tau_min": int(tau_min),
+            "min_instance_points": int(min_instance_points),
+            "voxel_dedup_m": float(voxel_dedup_m),
+            "output_path": str(settings.RESULTS_DIR / uuid4().hex),
+        }
+
+    def parse_auto_segmentation_args(
+        self, file_context: Optional[list], arguments: Optional[dict]
+    ) -> dict:
+        inputs = self.select_segmentation_inputs(file_context)
+        primary_file = inputs.get("point_cloud") or inputs.get("chm")
+        if not primary_file or not os.path.isfile(primary_file):
+            raise ValueError("请为单木分割选择一份可用的 LAS/LAZ 点云或 CHM 栅格文件。")
+
+        arguments = arguments if isinstance(arguments, dict) else {}
+        preference = arguments.get("preference", "auto")
+        include_small_trees = arguments.get("include_small_trees", False)
+        allow_large_cloud = arguments.get("allow_large_cloud", False)
+
+        valid_prefs = ("auto", "segmentanytree", "treelearn", "high_purity", "pycrown", "fast", "watershed")
+        if not isinstance(preference, str) or preference.strip().lower() not in valid_prefs:
+            raise ValueError(f"preference 必须为以下之一: {', '.join(valid_prefs)}。")
+        if type(include_small_trees) is not bool:
+            raise ValueError("include_small_trees 必须是布尔值。")
+        if type(allow_large_cloud) is not bool:
+            raise ValueError("allow_large_cloud 必须是布尔值。")
+
+        return {
+            "file_path": primary_file,
+            "preference": preference.strip().lower(),
+            "include_small_trees": include_small_trees,
+            "allow_large_cloud": allow_large_cloud,
+            "output_path": str(settings.RESULTS_DIR / uuid4().hex),
+        }
 
     def parse_raster_product_args(
         self, tool_name: str, file_context: Optional[list], arguments: Optional[dict]

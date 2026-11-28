@@ -1,8 +1,10 @@
 from collections import Counter, defaultdict
+import csv
 from pathlib import Path
 
 import laspy
 import numpy as np
+from scipy.sparse.csgraph import maximum_bipartite_matching
 from scipy.spatial import cKDTree
 
 TREE_INSTANCE_DIMENSION = "lidaragent_tree_id"
@@ -11,6 +13,7 @@ HEIGHT_ABOVE_GROUND_FIELDS = (HEIGHT_DIMENSION, "height_above_ground", "heightab
 BREAST_HEIGHT_MIN = 1.2
 BREAST_HEIGHT_MAX = 1.4
 STEM_SECTION_MIN_M = 0.8
+STEM_SECTION_MAX_M = 1.8
 CROWN_HEIGHT_FRACTION = 0.4
 STEM_ASSIGNMENT_RADIUS_M = 0.55
 TREETOP_HEIGHT_TOLERANCE_M = 1.5
@@ -24,6 +27,80 @@ def las_height_above_ground(las) -> np.ndarray | None:
         if name in dimensions:
             return np.asarray(las[dimensions[name]], dtype=np.float64)
     return None
+
+
+def compute_height_above_ground(las, *, dtm_cell_m: float = 2.0) -> tuple[np.ndarray, str]:
+    """Return per-point height above ground (metres) and the method used.
+
+    Priority:
+    1. Existing explicit HAG field (`lidaragent_hag` / `HeightAboveGround`).
+    2. IDW interpolation from ASPRS ground points (`classification == 2`).
+    3. Coarse local-minimum DTM grid (`dtm_cell_m`) IDW fallback when no ground
+       classification is present.
+    """
+    existing = las_height_above_ground(las)
+    if existing is not None and np.isfinite(existing).any():
+        return existing.astype(np.float64, copy=False), "existing_field"
+
+    x = np.asarray(las.x, dtype=np.float64)
+    y = np.asarray(las.y, dtype=np.float64)
+    z = np.asarray(las.z, dtype=np.float64)
+    n = len(z)
+    if n == 0:
+        return np.empty(0, dtype=np.float64), "empty"
+
+    finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+    hag = np.full(n, np.nan, dtype=np.float64)
+    if not finite.any():
+        return hag, "non_finite"
+
+    xy_all = np.column_stack((x[finite], y[finite]))
+    z_all = z[finite]
+
+    has_cls = "classification" in las.point_format.dimension_names
+    ground_mask = finite & (np.asarray(las.classification) == 2) if has_cls else np.zeros(n, dtype=bool)
+    n_ground = int(np.count_nonzero(ground_mask))
+
+    if n_ground >= 3:
+        g_xy = np.column_stack((x[ground_mask], y[ground_mask]))
+        g_z = z[ground_mask]
+        k = min(8, n_ground)
+        dists, idxs = cKDTree(g_xy).query(xy_all, k=k)
+        if k == 1:
+            z_ground = g_z[idxs]
+        else:
+            weights = 1.0 / np.maximum(dists, 1e-4)
+            z_ground = np.sum(weights * g_z[idxs], axis=1) / np.sum(weights, axis=1)
+        hag[finite] = z_all - z_ground
+        return hag, "ground_class_idw"
+
+    # Fallback: estimate coarse DTM from 5th-percentile Z per dtm_cell_m grid cell
+    min_xy = xy_all.min(axis=0)
+    cell_ij = np.floor((xy_all - min_xy) / float(dtm_cell_m)).astype(np.int64)
+    order = np.lexsort((cell_ij[:, 1], cell_ij[:, 0]))
+    sorted_ij = cell_ij[order]
+    sorted_z = z_all[order]
+    change = np.empty(len(order), dtype=bool)
+    change[0] = True
+    change[1:] = (sorted_ij[1:, 0] != sorted_ij[:-1, 0]) | (sorted_ij[1:, 1] != sorted_ij[:-1, 1])
+    starts = np.flatnonzero(change)
+    stops = np.r_[starts[1:], len(order)]
+
+    cell_centers = np.empty((len(starts), 2), dtype=np.float64)
+    cell_z = np.empty(len(starts), dtype=np.float64)
+    for idx_c, (s, e) in enumerate(zip(starts, stops)):
+        cell_centers[idx_c] = min_xy + (sorted_ij[s] + 0.5) * float(dtm_cell_m)
+        cell_z[idx_c] = float(np.percentile(sorted_z[s:e], 5))
+
+    k = min(4, len(cell_z))
+    dists, idxs = cKDTree(cell_centers).query(xy_all, k=k)
+    if k == 1:
+        z_ground = cell_z[idxs]
+    else:
+        weights = 1.0 / np.maximum(dists, 1e-4)
+        z_ground = np.sum(weights * cell_z[idxs], axis=1) / np.sum(weights, axis=1)
+    hag[finite] = z_all - z_ground
+    return hag, "local_grid_dtm"
 
 
 def label_traced_instances(
@@ -168,6 +245,33 @@ def _resolve_overlapping_crowns(cloud, selected, labels, crown_ceiling, stem_top
     labels[points[near][compatible]] = owners[compatible]
 
 
+def _link_shared_stems(anchors, candidate_stems, targets):
+    """Keep stem-to-apex links that every maximum one-to-one matching requires."""
+    assigned = np.zeros(len(anchors), dtype=np.int32)
+    if not len(candidate_stems) or not targets:
+        return assigned
+
+    tree_ids = np.asarray(list(targets), dtype=np.int32)
+    tops = np.asarray(list(targets.values()))[:, :2]
+    distances = cKDTree(anchors[candidate_stems]).sparse_distance_matrix(cKDTree(tops), 2.0, output_type="coo_matrix")
+    distances.data.fill(1)
+    graph = distances.tocsr()
+    matching = maximum_bipartite_matching(graph, perm_type="column")
+    maximum = np.count_nonzero(matching >= 0)
+    for row in np.flatnonzero(matching >= 0):
+        edge = graph.indptr[row] + np.flatnonzero(
+            graph.indices[graph.indptr[row]:graph.indptr[row + 1]] == matching[row]
+        )[0]
+        graph.data[edge] = 0
+        without_link = graph.copy()
+        without_link.eliminate_zeros()
+        alternative = maximum_bipartite_matching(without_link, perm_type="column")
+        if np.count_nonzero(alternative >= 0) < maximum:
+            assigned[candidate_stems[row]] = tree_ids[matching[row]]
+        graph.data[edge] = 1
+    return assigned
+
+
 def label_crown_and_stem_instances(
     cloud, crown_ids, transform, treetops, min_canopy_height_m, *,
     stem_positions=(), traced_labels=None, stem_top_m=6.5,
@@ -197,7 +301,7 @@ def label_crown_and_stem_instances(
         counts = Counter(anchor_ids)
         # A crown with competing stems cannot identify a unique lower trunk.
         eligible = np.array([tree_id in treetops and counts[tree_id] == 1 for tree_id in anchor_ids])
-        low = np.flatnonzero(free & ~canopy & (heights <= stem_top_m))
+        low = np.flatnonzero(~canopy & (heights <= stem_top_m))
         if len(low):
             distances, neighbours = cKDTree(anchors).query(
                 xy[low], k=2, distance_upper_bound=STEM_ASSIGNMENT_RADIUS_M,
@@ -205,14 +309,104 @@ def label_crown_and_stem_instances(
             unique = np.isfinite(distances[:, 0]) & ~np.isfinite(distances[:, 1])
             points, nearest = low[unique], neighbours[unique, 0]
             consistent = eligible[nearest] & ((crowns[points] == 0) | (crowns[points] == anchor_ids[nearest]))
-            labels[selected[points[consistent]]] = anchor_ids[nearest[consistent]]
+            direct = consistent & free[points]
+            labels[selected[points[direct]]] = anchor_ids[nearest[direct]]
+
+            in_section = heights[points] <= STEM_SECTION_MAX_M
+            at_breast = in_section & (heights[points] >= BREAST_HEIGHT_MIN) & (heights[points] <= BREAST_HEIGHT_MAX)
+            point_ids = labels[selected[points]]
+            shared = np.array([tree_id in treetops and counts[tree_id] > 1 for tree_id in anchor_ids])
+            occupied_stems = np.unique(nearest[in_section & (point_ids > 0)])
+            missing_stems = np.setdiff1d(np.unique(nearest[at_breast & (point_ids == 0) & shared[nearest]]), occupied_stems)
+            if len(missing_stems):
+                chest_ids = set(labels[selected[(heights >= BREAST_HEIGHT_MIN) & (heights <= BREAST_HEIGHT_MAX)]])
+                canopy_ids = set(labels[selected[heights > stem_top_m]])
+                missing_tops = {i: top for i, top in treetops.items() if i in canopy_ids and i not in chest_ids}
+                recovered = _link_shared_stems(anchors, missing_stems, missing_tops)[nearest]
+                compatible = (crowns[points] == 0) | (crowns[points] == anchor_ids[nearest]) | (crowns[points] == recovered)
+                add = in_section & (point_ids == 0) & (recovered > 0) & compatible
+                labels[selected[points[add]]] = recovered[add]
     _resolve_overlapping_crowns(cloud, selected, labels, crown_ceiling, stem_top_m)
     return labels
+
+
+def recover_occluded_instances(cloud, labels, crown_ids, transform, chm, stems, caps, treetops):
+    """Split point-only lower crowns with an independent stem and an upper owner."""
+    if not len(stems) or not treetops:
+        return labels, {}
+    anchors = np.asarray(stems, dtype=float)
+    stem_crowns = _sample_crown_ids(anchors, crown_ids, transform)
+    final_tops = np.asarray(list(treetops.values()))
+    inverse = ~transform
+    candidates = []
+    for stem_id, cap in caps.items():
+        if cap is None:
+            continue
+        x, y, height = cap
+        parent = int(stem_crowns[stem_id])
+        if parent not in treetops or not 10.0 <= height <= treetops[parent][2] - 3.0:
+            continue
+        col, row = np.floor(inverse * (x, y)).astype(int)
+        if not (0 <= row < chm.shape[0] and 0 <= col < chm.shape[1]):
+            continue
+        if crown_ids[row, col] != parent or chm[row, col] < height + 3.0:
+            continue
+        if np.any(
+            (np.linalg.norm(final_tops[:, :2] - (x, y), axis=1) <= 2.0)
+            & (np.abs(final_tops[:, 2] - height) <= TREETOP_HEIGHT_TOLERANCE_M)
+        ):
+            continue
+        upper = treetops[parent]
+        if any(
+            other is not None and other[2] > height + 3.0
+            and np.linalg.norm(np.asarray(other[:2]) - upper[:2]) <= 2.0
+            for other in caps.values()
+        ):
+            candidates.append((stem_id, parent, cap))
+    if not candidates:
+        return labels, {}
+
+    finite = np.flatnonzero(np.isfinite(cloud).all(axis=1))
+    nearby = cKDTree(cloud[finite, :2])
+    stems_index = cKDTree(anchors)
+    proposals = []
+    claims = np.zeros(len(labels), dtype=np.int32)
+    for stem_id, parent, (x, y, height) in candidates:
+        indices = finite[nearby.query_ball_point((x, y), r=1.25)]
+        indices = indices[(labels[indices] == parent) | (labels[indices] == 0)]
+        heights = cloud[indices, 2]
+        crown = (heights >= max(6.5, 0.35 * height)) & (heights <= height + TREETOP_HEIGHT_TOLERANCE_M)
+        lower = np.flatnonzero((heights >= STEM_SECTION_MIN_M) & (heights < 6.5))
+        distances, owners = stems_index.query(
+            cloud[indices[lower], :2], k=2, distance_upper_bound=STEM_ASSIGNMENT_RADIUS_M,
+        )
+        stem = lower[(owners[:, 0] == stem_id) & ~np.isfinite(distances[:, 1])]
+        if np.count_nonzero(crown) >= 100 and np.count_nonzero(
+            (heights[stem] >= BREAST_HEIGHT_MIN) & (heights[stem] <= BREAST_HEIGHT_MAX)
+        ) >= 12:
+            points = indices[np.r_[np.flatnonzero(crown), stem]]
+            claims[points] += 1
+            proposals.append((parent, points))
+
+    recovered = labels.copy()
+    parents = {}
+    for parent, points in proposals:
+        points = points[claims[points] == 1]
+        heights = cloud[points, 2]
+        if np.count_nonzero(heights >= 6.5) < 100 or np.count_nonzero(
+            (heights >= BREAST_HEIGHT_MIN) & (heights <= BREAST_HEIGHT_MAX)
+        ) < 12:
+            continue
+        tree_id = max(treetops) + len(parents) + 1
+        recovered[points] = tree_id
+        parents[tree_id] = parent
+    return recovered, parents
 
 
 def write_instance_cloud(
     source: Path, target: Path, height_above_ground, labels, *,
     method="stem_trace_and_unique_treetop_match",
+    summary_path=None, occluded_parent_ids=None,
 ) -> dict:
     """Copy the original LAS point record and append separate prediction fields."""
     las = laspy.read(source)
@@ -233,7 +427,7 @@ def write_instance_cloud(
     las.write(target)
     assigned = labels > 0
     slice_points = assigned & (heights >= BREAST_HEIGHT_MIN) & (heights <= BREAST_HEIGHT_MAX)
-    return {
+    metadata = {
         "filename": target.name,
         "method": method,
         "labelled_points": int(np.count_nonzero(assigned)),
@@ -241,3 +435,17 @@ def write_instance_cloud(
         "labelled_trees": int(len(np.unique(labels[assigned]))),
         "breast_height_labelled_points": int(np.count_nonzero(slice_points)),
     }
+    if summary_path is not None:
+        parents = occluded_parent_ids or {}
+        tree_ids, counts = np.unique(labels[assigned], return_counts=True)
+        max_heights = np.full(int(labels.max(initial=0)) + 1, -np.inf)
+        np.maximum.at(max_heights, labels[assigned], heights[assigned])
+        breast_counts = np.bincount(labels[slice_points], minlength=len(max_heights))
+        with summary_path.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(("tree_id", "point_count", "height_m", "breast_height_points", "parent_2d_crown_id"))
+            for tree_id, count in zip(tree_ids, counts):
+                writer.writerow((tree_id, count, max_heights[tree_id], breast_counts[tree_id], parents.get(tree_id)))
+        metadata["summary_filename"] = summary_path.name
+        metadata["occluded_tree_count"] = sum(int(tree_id) in parents for tree_id in tree_ids)
+    return metadata
